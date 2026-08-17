@@ -123,16 +123,22 @@ export interface JobResult {
   report?: string;
 }
 
+/** Default minutes a single commit's pipeline may run before it is aborted. */
+export const DEFAULT_JOB_TIMEOUT_MINUTES = 30;
+
 /**
  * How a checked-out worktree is built and run; injectable for tests. `onReport`
  * may be called any number of times with successive versions of the run's HTML
  * report — once when the run starts (all steps pending) and again as each step
  * finishes — so the server can publish an incrementally updating report. The
- * final report is returned in the {@link JobResult}.
+ * final report is returned in the {@link JobResult}. `signal` aborts when the
+ * job exceeds its timeout; the run is expected to stop its containers and
+ * resolve (with `ok: false`) rather than keep working.
  */
 export type RunJob = (
   worktreeDir: string,
   onReport: (report: string) => void,
+  signal: AbortSignal,
 ) => Promise<JobResult>;
 
 export interface CiServerOptions {
@@ -172,6 +178,20 @@ export interface CiServerOptions {
    * and is rewritten as each step finishes.
    */
   run?: RunJob;
+  /**
+   * Minutes one commit's job (fetch, checkout and the whole pipeline) may take
+   * before it is aborted and reported as failed. Defaults to
+   * {@link DEFAULT_JOB_TIMEOUT_MINUTES}. Because commits are tested one at a
+   * time, this also bounds how long a queued commit waits behind the one in
+   * front of it.
+   */
+  jobTimeoutMinutes?: number;
+  /**
+   * Schedule `fire` after `ms` milliseconds, returning a canceller that
+   * prevents it from firing. Used to enforce the job timeout; defaults to
+   * setTimeout/clearTimeout. Injectable for tests.
+   */
+  timer?: (ms: number, fire: () => void) => () => void;
   /** Sink for progress messages; defaults to console.error. */
   log?: (message: string) => void;
 }
@@ -179,9 +199,16 @@ export interface CiServerOptions {
 /**
  * An HTTP server that acts as the backend for a GitHub `push` and
  * `pull_request` webhook. Each accepted commit is checked out into its own git
- * worktree and run as an independent CI pipeline, so commits on different
- * branches are handled concurrently without interfering with each other or the
- * serving checkout.
+ * worktree and run as an independent CI pipeline, keeping the serving checkout
+ * untouched.
+ *
+ * Commits are tested strictly **one at a time**: a webhook that arrives while a
+ * pipeline is running is answered immediately and its commit queued, then built
+ * when the commit in front of it passes or fails. Building several commits at
+ * once oversubscribes the host — every pipeline wants the docker daemon, the
+ * disk and `maxConcurrency` containers of its own — which is what used to bring
+ * a busy server to a halt. Each job is also bounded by a timeout so one wedged
+ * pipeline cannot hold the queue closed indefinitely.
  */
 export class CiServer {
   readonly #repoRoot: string;
@@ -194,16 +221,19 @@ export class CiServer {
   readonly #publicUrl?: string;
   readonly #trustedPrOwners: ReadonlySet<string>;
   readonly #run: RunJob;
+  readonly #jobTimeoutMinutes: number;
+  readonly #timer: (ms: number, fire: () => void) => () => void;
   readonly #log: (message: string) => void;
   readonly #server: Server;
-  /** In-flight CI jobs, tracked so shutdown can wait for them to finish. */
-  readonly #jobs = new Set<Promise<void>>();
   /**
-   * Serialises git operations against the shared checkout. Concurrent fetches
-   * and worktree add/removes on one repo contend on git's ref/packed-refs
-   * lockfiles and can spuriously fail; this chain lets only one run at a time.
+   * Work in flight — the running job, plus any status posts made outside it —
+   * tracked so shutdown can wait for it to finish.
    */
-  #gitLock: Promise<unknown> = Promise.resolve();
+  readonly #jobs = new Set<Promise<void>>();
+  /** Accepted commits waiting for the runner, oldest first. */
+  readonly #queue: CiEvent[] = [];
+  /** The job running right now, if any. Only one commit is tested at a time. */
+  #active: Promise<void> | undefined;
   /** Monotonic counter making each worktree directory name unique. */
   #counter = 0;
 
@@ -218,6 +248,13 @@ export class CiServer {
     // Normalise away a trailing slash so `${publicUrl}/runs/<id>` is well-formed.
     this.#publicUrl = options.publicUrl?.replace(/\/+$/, "");
     this.#trustedPrOwners = options.trustedPrOwners ?? new Set();
+    this.#jobTimeoutMinutes = options.jobTimeoutMinutes ??
+      DEFAULT_JOB_TIMEOUT_MINUTES;
+    this.#timer = options.timer ??
+      ((ms, fire) => {
+        const handle = setTimeout(fire, ms);
+        return () => clearTimeout(handle);
+      });
     this.#log = options.log ?? ((m) => console.error(m));
     // Reconcile runs left `running` by a previous crash: this process now owns
     // the history, and any run still marked running was orphaned when the old
@@ -226,12 +263,15 @@ export class CiServer {
     if (orphaned > 0) {
       this.#log(`Marked ${orphaned} orphaned running job(s) as errored`);
     }
-    this.#run = options.run ?? (async (dir, onReport) => {
+    this.#run = options.run ?? (async (dir, onReport, signal) => {
       const config = await loadConfig(resolve(dir, this.#configFile));
       const render = (steps: StepReport[], ok: boolean): string =>
         renderReport(steps, { ok, configFile: this.#configFile });
       const result = await runPipeline(config, {
         captureOutput: true,
+        // On a timeout the pipeline stops every container and tears the network
+        // down before resolving, so the next queued commit starts on a clean host.
+        signal,
         // A run in progress has no verdict yet, so render interim reports as not
         // ok; renderReport shows a "running" header while any step is pending.
         onProgress: (steps) => onReport(render(steps, false)),
@@ -261,16 +301,46 @@ export class CiServer {
     return address.port;
   }
 
-  /** Wait for every in-flight CI job to finish. */
-  async drain(): Promise<void> {
-    await Promise.all([...this.#jobs]);
+  /** Number of accepted commits waiting behind the one being tested. */
+  get queued(): number {
+    return this.#queue.length;
   }
 
-  /** Stop accepting connections and wait for in-flight jobs to finish. */
+  /**
+   * Wait for the queue to empty and every job in it to finish. The loop matters
+   * because finishing one job starts the next, which joins the set after the
+   * snapshot the previous `Promise.all` was taken from.
+   */
+  async drain(): Promise<void> {
+    while (this.#jobs.size > 0) {
+      await Promise.all([...this.#jobs]);
+    }
+  }
+
+  /**
+   * Stop accepting connections and wait for the job in flight to finish.
+   * Commits still queued are dropped — waiting for a full queue could take
+   * hours — and reported to GitHub so their checks do not sit pending forever.
+   */
   async close(): Promise<void> {
     await new Promise<void>((resolvePromise) => {
       this.#server.close(() => resolvePromise());
     });
+    for (const event of this.#queue.splice(0)) {
+      this.#log(
+        `CI dropped at shutdown: ${event.repo} ${event.branch}@${
+          event.sha.slice(0, 12)
+        }`,
+      );
+      this.#track(
+        this.#report(
+          event.repo,
+          event.sha,
+          "error",
+          "whale-ci shut down before this commit was built",
+        ),
+      );
+    }
     await this.drain();
   }
 
@@ -326,8 +396,8 @@ export class CiServer {
         this.#log(`Ignoring pull request: ${decision.reason}`);
         return reply(res, 200, `Ignored (${decision.reason})`);
       }
-      // Accept now and run CI in the background so the webhook returns promptly.
-      this.#track(this.#runJob(decision.event));
+      // Accept now and queue the commit so the webhook returns promptly.
+      this.#enqueue(decision.event);
       return reply(res, 202, "Accepted");
     }
 
@@ -340,7 +410,7 @@ export class CiServer {
       return reply(res, 200, "Ignored (no buildable branch push)");
     }
 
-    this.#track(this.#runJob(push));
+    this.#enqueue(push);
     return reply(res, 202, "Accepted");
   }
 
@@ -351,11 +421,66 @@ export class CiServer {
   }
 
   /**
+   * Accept a commit for testing: append it to the queue and start it if nothing
+   * is running. A commit that has to wait gets a `pending` status right away,
+   * since otherwise its check would show nothing at all for as long as the
+   * queue takes to reach it.
+   */
+  #enqueue(event: CiEvent): void {
+    const ahead = this.#queue.length + (this.#active === undefined ? 0 : 1);
+    this.#queue.push(event);
+    if (ahead > 0) {
+      const runs = ahead === 1 ? "1 run" : `${ahead} runs`;
+      this.#log(
+        `CI queued: ${event.repo} ${event.branch}@${
+          event.sha.slice(0, 12)
+        } (${runs} ahead)`,
+      );
+      this.#track(
+        this.#report(
+          event.repo,
+          event.sha,
+          "pending",
+          `Queued for CI (${runs} ahead)`,
+        ),
+      );
+    }
+    this.#pump();
+  }
+
+  /**
+   * Start the next queued commit if the runner is idle. Called when a commit is
+   * accepted and again whenever a job settles, so the queue keeps draining one
+   * commit at a time.
+   */
+  #pump(): void {
+    if (this.#active !== undefined) return;
+    const event = this.#queue.shift();
+    if (event === undefined) return;
+    const job = this.#runJob(event)
+      // #runJob reports its own failures; this only catches something thrown
+      // around them (a broken run history, say), which must not wedge the queue.
+      .catch((err: unknown) => {
+        this.#log(`CI job aborted unexpectedly: ${(err as Error).message}`);
+      })
+      .finally(() => {
+        this.#active = undefined;
+        this.#pump();
+      });
+    this.#active = job;
+    this.#track(job);
+  }
+
+  /**
    * Run one commit through CI in its own worktree: report `pending`, fetch the
    * event's ref, check the exact commit out into a fresh worktree, run the
    * pipeline, then report the outcome and remove the worktree. Any failure of
    * git or the pipeline is reported to GitHub as `error`/`failure`;
    * status-reporting failures are logged but never abort cleanup.
+   *
+   * The whole job is bounded by the configured timeout. Exceeding it aborts the
+   * git operation or pipeline in flight — the pipeline stops its containers on
+   * the way out — and fails the commit, so the next queued commit can start.
    */
   async #runJob(event: CiEvent): Promise<void> {
     const { repo, branch, sha, fetchRef } = event;
@@ -379,62 +504,71 @@ export class CiServer {
       targetUrl,
     );
 
+    // Bound the job: a pipeline that never finishes would otherwise hold the
+    // queue — and every commit behind it — closed forever.
+    const controller = new AbortController();
+    let timedOut = false;
+    const expired = `CI timed out after ${
+      this.#jobTimeoutMinutes === 1 ? "1 minute" : `${this.#jobTimeoutMinutes} minutes`
+    }`;
+    const cancelTimeout = this.#timer(this.#jobTimeoutMinutes * 60_000, () => {
+      timedOut = true;
+      this.#log(`${expired}: ${repo} ${branch}@${short}`);
+      controller.abort();
+    });
+
     let created = false;
     try {
-      // Fetch and check out under the git lock; the pipeline itself runs outside
-      // it so independent jobs still build concurrently in their own worktrees.
-      await this.#withGitLock(async () => {
-        await this.#git.fetch(this.#repoRoot, fetchRef);
-        // Always the SHA from the event, never the tip of what was just
-        // fetched: a push racing this run must not swap in a commit that never
-        // passed the checks in `decidePullRequest`. If the ref has since moved
-        // and the object is gone, the worktree add fails and the run errors,
-        // which is the safe direction to fail in.
-        await this.#git.addWorktree(this.#repoRoot, worktreeDir, sha);
-        created = true;
-      });
+      await this.#git.fetch(this.#repoRoot, fetchRef, controller.signal);
+      // Always the SHA from the event, never the tip of what was just
+      // fetched: a push racing this run must not swap in a commit that never
+      // passed the checks in `decidePullRequest`. If the ref has since moved
+      // and the object is gone, the worktree add fails and the run errors,
+      // which is the safe direction to fail in.
+      await this.#git.addWorktree(
+        this.#repoRoot,
+        worktreeDir,
+        sha,
+        controller.signal,
+      );
+      created = true;
 
       // Publish each interim report as the run progresses, so the report page
       // at /runs/<id> updates live even though we do not stream.
-      const { ok, report } = await this.#run(
+      const result = await this.#run(
         worktreeDir,
         (interim) => this.#store.update(runId, interim),
+        controller.signal,
       );
-      this.#store.finish(runId, ok ? "success" : "failure", report);
-      this.#log(`CI ${ok ? "passed" : "failed"}: ${repo} ${branch}@${short}`);
+      // An aborted pipeline resolves with ok: false and a partial report; the
+      // commit failed either way, but say which so the check is not a mystery.
+      const ok = result.ok && !timedOut;
+      this.#store.finish(runId, ok ? "success" : "failure", result.report);
+      this.#log(
+        `CI ${ok ? "passed" : "failed"}: ${repo} ${branch}@${short}`,
+      );
       await this.#report(
         repo,
         sha,
         ok ? "success" : "failure",
-        ok ? "CI passed" : "CI failed",
+        timedOut ? expired : ok ? "CI passed" : "CI failed",
         targetUrl,
       );
     } catch (err) {
-      const message = (err as Error).message;
+      // A timeout that lands during fetch or checkout surfaces as git's abort
+      // error, which says nothing useful; report the timeout instead.
+      const message = timedOut ? expired : (err as Error).message;
       this.#store.finish(runId, "error");
       this.#log(`CI error: ${repo} ${branch}@${short}: ${message}`);
       await this.#report(repo, sha, "error", message, targetUrl);
     } finally {
+      cancelTimeout();
       if (created) {
-        await this.#withGitLock(() =>
-          this.#git.removeWorktree(this.#repoRoot, worktreeDir)
-        );
+        // Cleanup is deliberately not bound by the timeout: leaving the
+        // worktree behind would leak disk for every timed-out commit.
+        await this.#git.removeWorktree(this.#repoRoot, worktreeDir);
       }
     }
-  }
-
-  /**
-   * Run `fn` with exclusive access to the shared checkout, queued behind any
-   * git operation already in flight. The chain advances regardless of whether
-   * `fn` resolves or rejects, so one failed job never wedges later ones.
-   */
-  #withGitLock<T>(fn: () => Promise<T>): Promise<T> {
-    const result = this.#gitLock.then(fn, fn);
-    this.#gitLock = result.then(
-      () => undefined,
-      () => undefined,
-    );
-    return result;
   }
 
   /** Post a commit status, logging (not throwing) if GitHub rejects it. */

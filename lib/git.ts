@@ -13,13 +13,20 @@ export interface GitClient {
   /**
    * Fetch `ref` (a branch name or commit) from `origin` into the checkout at
    * `dir`, so a just-pushed commit is available locally before we check it out.
+   * Aborting `signal` kills the fetch, so a hung network operation cannot hold
+   * a job (and the commits queued behind it) open forever.
    */
-  fetch(dir: string, ref: string): Promise<void>;
+  fetch(dir: string, ref: string, signal?: AbortSignal): Promise<void>;
   /**
    * Create a detached worktree at `path` checked out to `commit`. The repo is
-   * the checkout rooted at `dir`.
+   * the checkout rooted at `dir`. Aborting `signal` kills the checkout.
    */
-  addWorktree(dir: string, path: string, commit: string): Promise<void>;
+  addWorktree(
+    dir: string,
+    path: string,
+    commit: string,
+    signal?: AbortSignal,
+  ): Promise<void>;
   /** Remove the worktree at `path` (best effort; never rejects). */
   removeWorktree(dir: string, path: string): Promise<void>;
 }
@@ -71,12 +78,17 @@ export class CliGitClient implements GitClient {
     return result.stdout.trim();
   }
 
-  async fetch(dir: string, ref: string): Promise<void> {
-    await this.#run(dir, fetchArgs(ref), { check: true });
+  async fetch(dir: string, ref: string, signal?: AbortSignal): Promise<void> {
+    await this.#run(dir, fetchArgs(ref), { check: true, signal });
   }
 
-  async addWorktree(dir: string, path: string, commit: string): Promise<void> {
-    await this.#run(dir, addWorktreeArgs(path, commit), { check: true });
+  async addWorktree(
+    dir: string,
+    path: string,
+    commit: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    await this.#run(dir, addWorktreeArgs(path, commit), { check: true, signal });
   }
 
   async removeWorktree(dir: string, path: string): Promise<void> {
@@ -87,16 +99,18 @@ export class CliGitClient implements GitClient {
   /**
    * Spawn `git -C <dir>` with the given args, capturing stdout/stderr. Rejects
    * on a non-zero exit only when `check` is set; otherwise resolves with the
-   * captured result so callers can inspect the exit code themselves.
+   * captured result so callers can inspect the exit code themselves. An
+   * aborted `signal` kills the subprocess, which rejects with its abort error.
    */
   #run(
     dir: string,
     args: string[],
-    opts: { check?: boolean } = {},
+    opts: { check?: boolean; signal?: AbortSignal } = {},
   ): Promise<GitResult> {
     return new Promise((resolvePromise, reject) => {
       const child = spawn(this.#git, ["-C", dir, ...args], {
         stdio: ["ignore", "pipe", "pipe"],
+        signal: opts.signal,
       });
       let stdout = "";
       let stderr = "";

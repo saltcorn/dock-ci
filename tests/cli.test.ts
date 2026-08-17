@@ -29,8 +29,26 @@ test("parses a lone config file", async () => {
     serve: false,
     dumpYaml: false,
     maxConcurrency: 4,
+    jobTimeout: 30,
     step: undefined,
   });
+});
+
+test("parses --job-timeout and defaults it to 30 minutes", async () => {
+  assert.equal((await parseArgs(["ci.yml"])).jobTimeout, 30);
+  assert.equal(
+    (await parseArgs(["--serve", "--job-timeout", "90", "ci.yml"])).jobTimeout,
+    90,
+  );
+  assert.equal(
+    (await parseArgs(["ci.yml", "--job-timeout=5"])).jobTimeout,
+    5,
+  );
+});
+
+test("a non-positive or non-numeric --job-timeout is an error", async () => {
+  assert.match(await parseError(["--job-timeout", "0", "ci.yml"]), /positive integer/);
+  assert.notEqual((await parse(app, ["--job-timeout", "soon", "ci.yml"]))._tag, "ok");
 });
 
 test("parses an optional step name after the config file", async () => {

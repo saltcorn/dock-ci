@@ -247,6 +247,14 @@ At the end, whether the test succeeded or not, all running containers are stoppe
 
 `npx whale-ci --serve ci.yml`
 
+* `--job-timeout <minutes>`: server mode only. The number of minutes one
+  commit's pipeline may run before it is aborted (stopping its containers) and
+  the commit reported as failed. Defaults to 30. Since the server tests one
+  commit at a time, this also bounds how long a queued commit waits behind the
+  one in front of it.
+
+`npx whale-ci --serve --job-timeout 60 ci.yml`
+
 # Server mode (GitHub webhook backend)
 
 With `--serve`, whale-ci runs as a long-lived HTTP server that GitHub can call as
@@ -278,9 +286,9 @@ The server also serves a small dashboard:
 Requests to any other path get a `404`.
 
 The command must be run **from the root of a git checkout** that contains the
-named config file; it refuses to start otherwise. Because several commits (on
-different branches) may be in flight at once, the server never builds in the
-serving checkout itself. Instead, for each commit it:
+named config file; it refuses to start otherwise. The server never builds in the
+serving checkout itself, so a run can never disturb it. Instead, for each commit
+it:
 
 1. verifies the webhook's `X-Hub-Signature-256` against `WEBHOOK_SECRET`;
 2. posts a `pending` commit status (linking to the run's report page when
@@ -295,8 +303,33 @@ serving checkout itself. Instead, for each commit it:
 5. posts a `success` or `failure` (or `error`) commit status; and
 6. removes the worktree.
 
-Using a separate worktree per run lets commits on different branches be tested
-concurrently without interfering with each other.
+Using a separate worktree per run keeps each commit's build isolated from the
+serving checkout and from the previous run's tree.
+
+## One commit at a time
+
+Commits are tested **strictly one at a time**. A webhook that arrives while a
+pipeline is running is answered immediately (`202`) and its commit put on a
+queue, then built once the commit in front of it has passed or failed. Building
+several commits at once oversubscribes the host — each pipeline wants the docker
+daemon, the disk, and up to `--max-concurrency` containers of its own — which is
+what makes a busy server grind to a halt.
+
+A queued commit is given a `pending` commit status as soon as it is accepted,
+described as `Queued for CI (N runs ahead)`, so its check does not sit blank
+while it waits.
+
+Each job — the fetch, the checkout and the whole pipeline — is bounded by
+`--job-timeout`, 30 minutes by default. On expiry the run is aborted: every
+container it started is stopped and its network removed, the commit is reported
+as **failed** with `CI timed out after N minutes`, its partial report is kept,
+and the next queued commit starts. Without this a single wedged pipeline would
+hold the queue, and every commit behind it, closed indefinitely.
+
+On Ctrl-C the server stops listening and waits for the commit being tested to
+finish. Commits still on the queue are **not** built — waiting for a full queue
+could take hours — and are reported as `error` so their checks do not stay
+pending; push them again once the server is back.
 
 The server is configured entirely through environment variables:
 
@@ -346,7 +379,8 @@ unchanged), only from a fork whose owner is in `TRUSTED_PR_OWNERS`, and never
 when the pull request comes from a branch in the repository itself — that branch
 already produced a `push` event that built the same commit, and building both
 would run every such commit twice. Press Ctrl-C to stop the server; it waits for
-any in-flight CI jobs to finish before exiting.
+the in-flight CI job to finish before exiting (see
+[One commit at a time](#one-commit-at-a-time)).
 
 ## Fork pull requests (`TRUSTED_PR_OWNERS`)
 
@@ -509,9 +543,10 @@ EnvironmentFile=/etc/whale-ci.env
 ExecStart=/usr/bin/npx whale-ci --serve ci.yml
 Restart=on-failure
 RestartSec=5
-# Let in-flight CI jobs finish on stop (matches Ctrl-C behaviour)
+# Let the in-flight CI job finish on stop (matches Ctrl-C behaviour). Allow at
+# least as long as --job-timeout, or systemd will kill a slow run mid-flight.
 KillSignal=SIGINT
-TimeoutStopSec=300
+TimeoutStopSec=1860
 
 [Install]
 WantedBy=multi-user.target

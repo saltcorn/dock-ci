@@ -22,7 +22,12 @@ import { RunStore } from "../lib/history.ts";
 import { runShell } from "../lib/proc.ts";
 import { renderReport } from "../lib/report.ts";
 import { runPipeline } from "../lib/runner.ts";
-import { CiServer, serverConfigFromEnv, verifyCheckout } from "../lib/server.ts";
+import {
+  CiServer,
+  DEFAULT_JOB_TIMEOUT_MINUTES,
+  serverConfigFromEnv,
+  verifyCheckout,
+} from "../lib/server.ts";
 import { ConfigError } from "../lib/types.ts";
 
 /** A whole number of containers, at least one. */
@@ -75,6 +80,17 @@ export const app = command({
         "push only-if conditions are annotated with whether they pass. Useful " +
         "for debugging a pipeline definition.",
     }),
+    jobTimeout: option({
+      type: positiveInteger,
+      long: "job-timeout",
+      defaultValue: () => DEFAULT_JOB_TIMEOUT_MINUTES,
+      defaultValueIsSerializable: true,
+      description:
+        "Server mode only: the number of minutes one commit's pipeline may " +
+        "run before it is aborted and the commit reported as failed. The " +
+        "server tests one commit at a time, so this also bounds how long a " +
+        "queued commit waits behind the one in front of it.",
+    }),
     serve: flag({
       long: "serve",
       description:
@@ -97,7 +113,9 @@ export const app = command({
         "All other steps are skipped entirely.",
     }),
   },
-  handler: ({ output, serve, dumpYaml, configFile, step, maxConcurrency }) => {
+  handler: (
+    { output, serve, dumpYaml, configFile, step, maxConcurrency, jobTimeout },
+  ) => {
     if (serve && step !== undefined) {
       console.error("Error: a step name cannot be combined with --serve");
       return Promise.resolve(1);
@@ -110,7 +128,7 @@ export const app = command({
       return runDumpYaml(configFile);
     }
     return serve
-      ? runServe(configFile)
+      ? runServe(configFile, jobTimeout)
       : runCli(configFile, maxConcurrency, output, step);
   },
 });
@@ -233,10 +251,14 @@ async function gitContext(): Promise<{ branch?: string; commit?: string }> {
 /**
  * Run as a GitHub webhook CI server. Validates that the current directory is the
  * root of a git checkout containing `configFile`, reads its settings from the
- * environment, and serves until interrupted (Ctrl-C), draining in-flight CI jobs
- * before returning. Returns the process exit code.
+ * environment, and serves until interrupted (Ctrl-C), letting the CI job in
+ * flight finish before returning. Commits are tested one at a time, each bounded
+ * by `jobTimeoutMinutes`. Returns the process exit code.
  */
-async function runServe(configFile: string): Promise<number> {
+async function runServe(
+  configFile: string,
+  jobTimeoutMinutes: number,
+): Promise<number> {
   try {
     const env = serverConfigFromEnv(process.env);
     const git = new CliGitClient();
@@ -256,19 +278,21 @@ async function runServe(configFile: string): Promise<number> {
       store,
       publicUrl: env.publicUrl,
       trustedPrOwners: env.trustedPrOwners,
+      jobTimeoutMinutes,
     });
 
     await server.listen(env.listenPort);
     console.error(
       `whale-ci serving webhooks on port ${env.listenPort} ` +
         `(dashboard at ${env.publicUrl ?? `http://localhost:${env.listenPort}`}/, ` +
-        `checkout ${repoRoot}, worktrees under ${env.worktreeRoot})`,
+        `checkout ${repoRoot}, worktrees under ${env.worktreeRoot}, ` +
+        `one commit at a time, ${jobTimeoutMinutes} minute job timeout)`,
     );
 
-    // Run until Ctrl-C, then stop listening and let running jobs finish.
+    // Run until Ctrl-C, then stop listening and let the running job finish.
     await new Promise<void>((resolvePromise) => {
       const onSigint = (): void => {
-        console.error("\nShutting down; waiting for in-flight CI jobs...");
+        console.error("\nShutting down; waiting for the in-flight CI job...");
         process.removeListener("SIGINT", onSigint);
         void server.close().then(resolvePromise);
       };

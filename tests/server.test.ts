@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { CiServer, type JobResult, type RunJob, serverConfigFromEnv, verifyCheckout } from "../lib/server.ts";
+import { CiServer, type CiServerOptions, DEFAULT_JOB_TIMEOUT_MINUTES, type JobResult, type RunJob, serverConfigFromEnv, verifyCheckout } from "../lib/server.ts";
 import type { CommitState, StatusReporter } from "../lib/github.ts";
 import type { GitClient } from "../lib/git.ts";
 import { RunStore } from "../lib/history.ts";
@@ -88,6 +88,7 @@ async function startServer(
   git = new FakeGit("/repo"),
   publicUrl?: string,
   trustedPrOwners?: ReadonlySet<string>,
+  extra: Partial<CiServerOptions> = {},
 ): Promise<Harness> {
   const status = new FakeStatus();
   const store = new RunStore(":memory:");
@@ -102,11 +103,12 @@ async function startServer(
     store,
     publicUrl,
     trustedPrOwners,
-    run: (dir, onReport) => {
+    run: (dir, onReport, signal) => {
       runDirs.push(dir);
-      return run(dir, onReport);
+      return run(dir, onReport, signal);
     },
     log: () => {},
+    ...extra,
   });
   await server.listen(0);
   return { server, git, status, store, runDirs };
@@ -115,6 +117,13 @@ async function startServer(
 /** A run stub that always finishes with `ok` and a small fixed report. */
 function fixedRun(ok: boolean): RunJob {
   return async () => ({ ok, report: `<html>report ${ok}</html>` });
+}
+
+/** A gate a test can hold a run at, then release. */
+function gate(): { wait: Promise<void>; release: () => void } {
+  let release!: () => void;
+  const wait = new Promise<void>((r) => (release = r));
+  return { wait, release };
 }
 
 /** POST a webhook to the running server with a (correct by default) signature. */
@@ -506,59 +515,224 @@ test("a git/pipeline error reports error and skips a never-made worktree", async
   }
 });
 
-test("concurrent pushes get distinct worktrees", async () => {
-  // A run that blocks until released, so both jobs are in flight at once.
-  let release!: () => void;
-  const gate = new Promise<void>((r) => (release = r));
-  const { server, runDirs } = await startServer(async () => {
-    await gate;
+const OTHER_PUSH = {
+  ...PUSH,
+  ref: "refs/heads/other",
+  after: "f00df00df00d",
+};
+
+test("a push arriving during a run is queued, not run concurrently", async () => {
+  // A run that blocks until released, so the second push arrives mid-run.
+  const first = gate();
+  const { server, runDirs, status } = await startServer(async () => {
+    await first.wait;
     return { ok: true };
   });
   try {
     await postWebhook(server, "push", PUSH);
-    await postWebhook(server, "push", {
-      ...PUSH,
-      ref: "refs/heads/other",
-      after: "f00df00df00d",
-    });
-    // Give both requests a tick to reach the run() stub before releasing.
+    const res = await postWebhook(server, "push", OTHER_PUSH);
+    // The webhook is still answered promptly even though nothing can run yet.
+    assert.equal(res.status, 202);
     await new Promise((r) => setTimeout(r, 50));
+    // Only the first commit is being tested; the second waits its turn.
+    assert.equal(runDirs.length, 1);
+    assert.equal(server.queued, 1);
+    // The queued commit already shows up as pending on GitHub.
+    assert.ok(
+      status.reports.some((r) =>
+        r.sha === OTHER_PUSH.after && r.state === "pending" &&
+        r.description === "Queued for CI (1 run ahead)"
+      ),
+    );
+
+    first.release();
+    await server.drain();
+    // Both commits ran, in arrival order, in worktrees of their own.
     assert.equal(runDirs.length, 2);
     assert.notEqual(runDirs[0], runDirs[1]);
-    release();
-    await server.drain();
+    assert.equal(server.queued, 0);
   } finally {
     await server.close();
   }
 });
 
-test("git operations on the shared checkout never overlap across concurrent pushes", async () => {
+test("queued commits are counted and run one at a time in arrival order", async () => {
+  const first = gate();
+  let started = 0;
+  let concurrent = 0;
+  const { server, status } = await startServer(async () => {
+    concurrent = Math.max(concurrent, ++started);
+    if (started === 1) await first.wait;
+    started--;
+    return { ok: true };
+  });
+  try {
+    await postWebhook(server, "push", PUSH);
+    await postWebhook(server, "push", OTHER_PUSH);
+    await postWebhook(server, "push", { ...PUSH, after: "beefbeefbeef" });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(server.queued, 2);
+    // The third commit is told how many runs it is waiting behind.
+    assert.ok(
+      status.reports.some((r) =>
+        r.sha === "beefbeefbeef" &&
+        r.description === "Queued for CI (2 runs ahead)"
+      ),
+    );
+
+    first.release();
+    await server.drain();
+    // No two pipelines ever overlapped.
+    assert.equal(concurrent, 1);
+    // Each commit reached a final state, in the order the pushes arrived.
+    assert.deepEqual(
+      status.reports.filter((r) => r.state === "success").map((r) => r.sha),
+      [PUSH.after, OTHER_PUSH.after, "beefbeefbeef"],
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test("git operations on the shared checkout never overlap across pushes", async () => {
   const git = new FakeGit("/repo");
   // Stretch each git op so two unsynchronised jobs would overlap in time.
   git.opDelayMs = 20;
-  // Hold both pipelines in flight at once so their git ops have the chance to.
-  let release!: () => void;
-  const gate = new Promise<void>((r) => (release = r));
-  const { server } = await startServer(async () => {
-    await gate;
-    return { ok: true };
-  }, git);
+  const { server } = await startServer(fixedRun(true), git);
   try {
     await postWebhook(server, "push", PUSH);
-    await postWebhook(server, "push", {
-      ...PUSH,
-      ref: "refs/heads/other",
-      after: "f00df00df00d",
-    });
-    // Let both jobs work through fetch + add and park in the blocked run().
-    await new Promise((r) => setTimeout(r, 100));
-    release();
+    await postWebhook(server, "push", OTHER_PUSH);
     await server.drain();
-    // The lock kept fetch/add/remove strictly one-at-a-time across both jobs.
+    // Serialising whole jobs keeps fetch/add/remove one-at-a-time as well.
     assert.equal(git.maxInFlight, 1);
     // Both jobs still completed their full git sequence.
     assert.equal(git.calls.filter((c) => c.startsWith("fetch ")).length, 2);
     assert.equal(git.calls.filter((c) => c.startsWith("remove ")).length, 2);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a job that outlives its timeout is aborted and fails the commit", async () => {
+  let fire!: () => void;
+  const cancelled: boolean[] = [];
+  // Capture the job's timeout instead of waiting for a real one.
+  const timer = (_ms: number, onFire: () => void): (() => void) => {
+    fire = onFire;
+    return () => cancelled.push(true);
+  };
+  // A run that only settles once its signal aborts, like a wedged pipeline
+  // whose containers are torn down on the way out.
+  const { server, status, store } = await startServer(
+    (_dir, _onReport, signal) =>
+      new Promise((r) =>
+        signal.addEventListener("abort", () => r({ ok: false, report: "<p>partial" }), {
+          once: true,
+        })
+      ),
+    new FakeGit("/repo"),
+    undefined,
+    undefined,
+    { timer, jobTimeoutMinutes: 7 },
+  );
+  try {
+    await postWebhook(server, "push", PUSH);
+    await new Promise((r) => setTimeout(r, 50));
+    fire();
+    await server.drain();
+
+    assert.deepEqual(status.states, ["pending", "failure"]);
+    assert.equal(
+      status.reports.at(-1)?.description,
+      "CI timed out after 7 minutes",
+    );
+    // The partial report is still stored, and the run recorded as failed.
+    assert.equal(store.recent()[0]?.status, "failure");
+    assert.equal(store.report(1), "<p>partial");
+  } finally {
+    await server.close();
+  }
+});
+
+test("a timeout releases the queue for the next commit", async () => {
+  let fire!: () => void;
+  const timer = (_ms: number, onFire: () => void): (() => void) => {
+    fire = onFire;
+    return () => {};
+  };
+  const runs: string[] = [];
+  const { server } = await startServer(
+    (dir, _onReport, signal) => {
+      runs.push(dir);
+      // The first run hangs until aborted; the second finishes normally.
+      if (runs.length > 1) return Promise.resolve({ ok: true });
+      return new Promise((r) =>
+        signal.addEventListener("abort", () => r({ ok: false }), { once: true })
+      );
+    },
+    new FakeGit("/repo"),
+    undefined,
+    undefined,
+    { timer },
+  );
+  try {
+    await postWebhook(server, "push", PUSH);
+    await postWebhook(server, "push", OTHER_PUSH);
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(runs.length, 1);
+    fire();
+    await server.drain();
+    assert.equal(runs.length, 2);
+  } finally {
+    await server.close();
+  }
+});
+
+test("the timer is cancelled when a job finishes in time", async () => {
+  let cancels = 0;
+  const timer = (): (() => void) => () => cancels++;
+  const { server } = await startServer(
+    fixedRun(true),
+    new FakeGit("/repo"),
+    undefined,
+    undefined,
+    { timer },
+  );
+  try {
+    await postWebhook(server, "push", PUSH);
+    await server.drain();
+    assert.equal(cancels, 1);
+  } finally {
+    await server.close();
+  }
+});
+
+test("the job timeout defaults to 30 minutes", () => {
+  assert.equal(DEFAULT_JOB_TIMEOUT_MINUTES, 30);
+});
+
+test("shutting down drops queued commits and reports them", async () => {
+  const first = gate();
+  const { server, status, runDirs } = await startServer(async () => {
+    await first.wait;
+    return { ok: true };
+  });
+  try {
+    await postWebhook(server, "push", PUSH);
+    await postWebhook(server, "push", OTHER_PUSH);
+    await new Promise((r) => setTimeout(r, 50));
+
+    // close() waits for the running job, so let it finish once it is under way.
+    const closed = server.close();
+    await new Promise((r) => setTimeout(r, 20));
+    first.release();
+    await closed;
+
+    // Only the running commit was built; the queued one was told it will not be.
+    assert.equal(runDirs.length, 1);
+    const dropped = status.reports.filter((r) => r.sha === OTHER_PUSH.after);
+    assert.equal(dropped.at(-1)?.state, "error");
+    assert.match(dropped.at(-1)?.description ?? "", /shut down/);
   } finally {
     await server.close();
   }
