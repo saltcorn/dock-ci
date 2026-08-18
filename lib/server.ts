@@ -205,6 +205,14 @@ export interface CiServerOptions {
    */
   trustedPrOwners?: ReadonlySet<string>;
   /**
+   * Branch names whose webhooks are dropped without being built or recorded,
+   * from `--ignore-branch`. A push to one of these branches (or a pull request
+   * from one) is acknowledged and then forgotten: no run appears in the
+   * history and no commit status is posted. Defaults to empty, which ignores
+   * nothing.
+   */
+  ignoredBranches?: ReadonlySet<string>;
+  /**
    * The operator account that may rerun failed runs from the dashboard.
    * Defaults to the `admin` username with no password, which disables `/login`
    * entirely: without a password nothing can authenticate, so the dashboard
@@ -261,6 +269,7 @@ export class CiServer {
   readonly #store: RunHistory;
   readonly #publicUrl?: string;
   readonly #trustedPrOwners: ReadonlySet<string>;
+  readonly #ignoredBranches: ReadonlySet<string>;
   readonly #auth: AuthConfig;
   /**
    * Key session cookies are encrypted with, derived from the configured
@@ -296,6 +305,7 @@ export class CiServer {
     // Normalise away a trailing slash so `${publicUrl}/runs/<id>` is well-formed.
     this.#publicUrl = options.publicUrl?.replace(/\/+$/, "");
     this.#trustedPrOwners = options.trustedPrOwners ?? new Set();
+    this.#ignoredBranches = options.ignoredBranches ?? new Set();
     this.#auth = options.auth ?? { username: DEFAULT_ADMIN_USERNAME };
     this.#sessionKey = this.#auth.password === undefined ||
         this.#auth.password === ""
@@ -467,6 +477,9 @@ export class CiServer {
         this.#log(`Ignoring pull request: ${decision.reason}`);
         return reply(res, 200, `Ignored (${decision.reason})`);
       }
+      if (this.#ignoredBranches.has(decision.event.branch)) {
+        return reply(res, 200, `Ignored (branch "${decision.event.branch}")`);
+      }
       // Accept now and queue the commit so the webhook returns promptly.
       this.#enqueue(decision.event);
       return reply(res, 202, "Accepted");
@@ -479,6 +492,13 @@ export class CiServer {
     const push = parsePushEvent(payload);
     if (push === undefined) {
       return reply(res, 200, "Ignored (no buildable branch push)");
+    }
+
+    // An ignored branch is dropped here, before anything is recorded or
+    // reported: no run in the history, no commit status, no log line. The
+    // point of the flag is that pushes to e.g. gh-pages leave no trace at all.
+    if (this.#ignoredBranches.has(push.branch)) {
+      return reply(res, 200, `Ignored (branch "${push.branch}")`);
     }
 
     this.#enqueue(push);

@@ -30,8 +30,22 @@ test("parses a lone config file", async () => {
     dumpYaml: false,
     maxConcurrency: 4,
     jobTimeout: 30,
+    ignoreBranches: undefined,
     step: undefined,
   });
+});
+
+test("parses --ignore-branch, which is unset by default", async () => {
+  assert.equal((await parseArgs(["ci.yml"])).ignoreBranches, undefined);
+  assert.equal(
+    (await parseArgs(["--serve", "--ignore-branch", "gh-pages,wip", "ci.yml"]))
+      .ignoreBranches,
+    "gh-pages,wip",
+  );
+  assert.equal(
+    (await parseArgs(["ci.yml", "--ignore-branch=gh-pages"])).ignoreBranches,
+    "gh-pages",
+  );
 });
 
 test("parses --job-timeout and defaults it to 30 minutes", async () => {

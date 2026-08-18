@@ -4,6 +4,7 @@ import { test } from "node:test";
 import {
   decidePullRequest,
   parsePushEvent,
+  parseIgnoredBranches,
   parseTrustedOwners,
   pullRequestRef,
   statusUrl,
@@ -221,4 +222,16 @@ test("statusUrl addresses the commit-statuses API", () => {
     statusUrl("owner/repo", "abc123"),
     "https://api.github.com/repos/owner/repo/statuses/abc123",
   );
+});
+
+test("parseIgnoredBranches splits and trims but keeps case", () => {
+  assert.deepEqual(
+    parseIgnoredBranches("gh-pages, Feature/X ,wip"),
+    new Set(["gh-pages", "Feature/X", "wip"]),
+  );
+  assert.deepEqual(parseIgnoredBranches(undefined), new Set());
+  assert.deepEqual(parseIgnoredBranches(""), new Set());
+  assert.deepEqual(parseIgnoredBranches("  "), new Set());
+  // Empty entries from a trailing or doubled comma are dropped.
+  assert.deepEqual(parseIgnoredBranches("gh-pages,,"), new Set(["gh-pages"]));
 });

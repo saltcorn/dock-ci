@@ -79,6 +79,7 @@ export type { GitClient, GitResult } from "./git.ts";
 export {
   decidePullRequest,
   GitHubStatusReporter,
+  parseIgnoredBranches,
   parsePushEvent,
   parseTrustedOwners,
   pullRequestRef,

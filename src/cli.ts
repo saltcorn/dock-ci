@@ -17,7 +17,10 @@ import {
 import { loadConfig, restrictToStep } from "../lib/config.ts";
 import { dumpEvaluatedConfig } from "../lib/dump.ts";
 import { CliGitClient } from "../lib/git.ts";
-import { GitHubStatusReporter } from "../lib/github.ts";
+import {
+  GitHubStatusReporter,
+  parseIgnoredBranches,
+} from "../lib/github.ts";
 import { RunStore } from "../lib/history.ts";
 import { runShell } from "../lib/proc.ts";
 import { renderReport } from "../lib/report.ts";
@@ -91,6 +94,15 @@ export const app = command({
         "server tests one commit at a time, so this also bounds how long a " +
         "queued commit waits behind the one in front of it.",
     }),
+    ignoreBranches: option({
+      type: optional(string),
+      long: "ignore-branch",
+      description:
+        "Server mode only: comma-separated branch names whose webhooks are " +
+        "ignored completely (e.g. \"gh-pages,wip\"). A push to one of these " +
+        "branches is neither built nor recorded, so it never appears in the " +
+        "run list and no commit status is posted for it.",
+    }),
     serve: flag({
       long: "serve",
       description:
@@ -116,7 +128,16 @@ export const app = command({
     }),
   },
   handler: (
-    { output, serve, dumpYaml, configFile, step, maxConcurrency, jobTimeout },
+    {
+      output,
+      serve,
+      dumpYaml,
+      configFile,
+      step,
+      maxConcurrency,
+      jobTimeout,
+      ignoreBranches,
+    },
   ) => {
     if (serve && step !== undefined) {
       console.error("Error: a step name cannot be combined with --serve");
@@ -130,7 +151,7 @@ export const app = command({
       return runDumpYaml(configFile);
     }
     return serve
-      ? runServe(configFile, jobTimeout)
+      ? runServe(configFile, jobTimeout, parseIgnoredBranches(ignoreBranches))
       : runCli(configFile, maxConcurrency, output, step);
   },
 });
@@ -255,11 +276,13 @@ async function gitContext(): Promise<{ branch?: string; commit?: string }> {
  * root of a git checkout containing `configFile`, reads its settings from the
  * environment, and serves until interrupted (Ctrl-C), letting the CI job in
  * flight finish before returning. Commits are tested one at a time, each bounded
- * by `jobTimeoutMinutes`. Returns the process exit code.
+ * by `jobTimeoutMinutes`; webhooks for a branch in `ignoredBranches` are dropped
+ * on arrival. Returns the process exit code.
  */
 async function runServe(
   configFile: string,
   jobTimeoutMinutes: number,
+  ignoredBranches: ReadonlySet<string>,
 ): Promise<number> {
   try {
     const env = serverConfigFromEnv(process.env);
@@ -280,6 +303,7 @@ async function runServe(
       store,
       publicUrl: env.publicUrl,
       trustedPrOwners: env.trustedPrOwners,
+      ignoredBranches,
       auth: env.auth,
       jobTimeoutMinutes,
     });
@@ -291,6 +315,11 @@ async function runServe(
         `checkout ${repoRoot}, worktrees under ${env.worktreeRoot}, ` +
         `one commit at a time, ${jobTimeoutMinutes} minute job timeout)`,
     );
+    if (ignoredBranches.size > 0) {
+      console.error(
+        `Ignoring webhooks for branches: ${[...ignoredBranches].join(", ")}`,
+      );
+    }
     if (env.auth.password === undefined) {
       console.error(
         "ADMIN_PASSWORD is not set: /login always fails and the dashboard is " +

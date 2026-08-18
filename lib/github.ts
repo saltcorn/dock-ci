@@ -145,6 +145,22 @@ export function parseTrustedOwners(raw: string | undefined): Set<string> {
   );
 }
 
+/**
+ * Parse a comma-separated list of branch names into the set of branches whose
+ * webhooks are ignored entirely. Blank entries are dropped and surrounding
+ * whitespace trimmed; case is kept as written, since git branch names are
+ * case-sensitive. An unset or all-blank value yields an empty set, which
+ * ignores nothing.
+ */
+export function parseIgnoredBranches(raw: string | undefined): Set<string> {
+  return new Set(
+    (raw ?? "")
+      .split(",")
+      .map((branch) => branch.trim())
+      .filter((branch) => branch !== ""),
+  );
+}
+
 /** Whether a `pull_request` payload should be built, and if not, why not. */
 export type PullRequestDecision =
   | { run: true; event: CiEvent }

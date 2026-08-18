@@ -255,6 +255,16 @@ At the end, whether the test succeeded or not, all running containers are stoppe
 
 `npx whale-ci --serve --job-timeout 60 ci.yml`
 
+* `--ignore-branch <names>`: server mode only. A comma-separated list of branch
+  names whose webhooks are ignored completely. A push to one of these branches
+  (or a fork pull request from one) is acknowledged and then dropped: nothing is
+  fetched, no commit status is posted, and no line appears in the run list —
+  useful for branches that carry no pipeline, such as `gh-pages`. Names are
+  matched exactly, so neither a prefix nor a differently-cased name matches.
+  Ignores nothing by default.
+
+`npx whale-ci --serve --ignore-branch gh-pages,wip ci.yml`
+
 # Server mode (GitHub webhook backend)
 
 With `--serve`, whale-ci runs as a long-lived HTTP server that GitHub can call as
@@ -263,6 +273,10 @@ the `/webhook` path (configure GitHub's payload URL as
 `http://<host>:<port>/webhook`; `application/json` content type). Each accepted commit is built and tested, and
 the result is reported back to GitHub as a commit status (so it shows up as a
 check on the commit and pull request).
+
+Branches you never want built — a `gh-pages` documentation branch, say — can be
+listed in `--ignore-branch`; their webhooks are dropped on arrival and leave no
+trace in the run list.
 
 Subscribe the webhook to the **push** event. Pushes to branches in your own
 repository — including the branches behind your own pull requests — are built

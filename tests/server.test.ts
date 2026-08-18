@@ -759,6 +759,92 @@ test("shutting down drops queued commits and reports them", async () => {
   }
 });
 
+test("a push to an ignored branch leaves no run, status or git call", async () => {
+  const { server, git, status, store } = await startServer(
+    fixedRun(true),
+    new FakeGit("/repo"),
+    undefined,
+    undefined,
+    { ignoredBranches: new Set(["gh-pages", "feature/x"]) },
+  );
+  try {
+    const res = await postWebhook(server, "push", PUSH);
+    assert.equal(res.status, 200);
+    assert.match(await res.text(), /Ignored \(branch "feature\/x"\)/);
+    await server.drain();
+
+    // Completely ignored: nothing fetched, nothing reported to GitHub, and
+    // nothing for the dashboard's run list to show.
+    assert.deepEqual(git.calls, []);
+    assert.deepEqual(status.states, []);
+    assert.deepEqual(store.recent(), []);
+    assert.equal(server.queued, 0);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a push to a branch not on the ignore list still runs", async () => {
+  const { server, git, store } = await startServer(
+    fixedRun(true),
+    new FakeGit("/repo"),
+    undefined,
+    undefined,
+    { ignoredBranches: new Set(["gh-pages"]) },
+  );
+  try {
+    const res = await postWebhook(server, "push", PUSH);
+    assert.equal(res.status, 202);
+    await server.drain();
+
+    assert.deepEqual(git.calls[0], "fetch feature/x");
+    assert.equal(store.recent().length, 1);
+  } finally {
+    await server.close();
+  }
+});
+
+test("branch names are matched exactly, case and all", async () => {
+  const { server, git } = await startServer(
+    fixedRun(true),
+    new FakeGit("/repo"),
+    undefined,
+    undefined,
+    // Neither a differently-cased name nor a prefix of the pushed branch.
+    { ignoredBranches: new Set(["Feature/X", "feature"]) },
+  );
+  try {
+    const res = await postWebhook(server, "push", PUSH);
+    assert.equal(res.status, 202);
+    await server.drain();
+    assert.deepEqual(git.calls[0], "fetch feature/x");
+  } finally {
+    await server.close();
+  }
+});
+
+test("a pull request from an ignored head branch is dropped too", async () => {
+  const { server, git, status, store } = await startServer(
+    fixedRun(true),
+    new FakeGit("/repo"),
+    undefined,
+    new Set(["bob"]),
+    { ignoredBranches: new Set(["fork-feature"]) },
+  );
+  try {
+    const res = await postWebhook(server, "pull_request", FORK_PR);
+    assert.equal(res.status, 200);
+    assert.match(await res.text(), /Ignored \(branch "fork-feature"\)/);
+    await server.drain();
+
+    assert.deepEqual(git.calls, []);
+    assert.deepEqual(status.states, []);
+    assert.deepEqual(store.recent(), []);
+  } finally {
+    await server.close();
+  }
+});
+
 test("an unhandled event type is ignored", async () => {
   const { server, git } = await startServer(fixedRun(true));
   try {
