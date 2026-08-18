@@ -259,6 +259,12 @@ export interface CiServerOptions {
  * a busy server to a halt. Each job is also bounded by a timeout so one wedged
  * pipeline cannot hold the queue closed indefinitely.
  */
+/** A commit waiting in the queue, and the `pending` run recorded for it. */
+interface QueuedRun {
+  event: CiEvent;
+  runId: number;
+}
+
 export class CiServer {
   readonly #repoRoot: string;
   readonly #configFile: string;
@@ -287,8 +293,11 @@ export class CiServer {
    * tracked so shutdown can wait for it to finish.
    */
   readonly #jobs = new Set<Promise<void>>();
-  /** Accepted commits waiting for the runner, oldest first. */
-  readonly #queue: CiEvent[] = [];
+  /**
+   * Accepted commits waiting for the runner, oldest first, each paired with the
+   * id of the `pending` run already recorded for it.
+   */
+  readonly #queue: QueuedRun[] = [];
   /** The job running right now, if any. Only one commit is tested at a time. */
   #active: Promise<void> | undefined;
   /** Monotonic counter making each worktree directory name unique. */
@@ -319,12 +328,13 @@ export class CiServer {
         return () => clearTimeout(handle);
       });
     this.#log = options.log ?? ((m) => console.error(m));
-    // Reconcile runs left `running` by a previous crash: this process now owns
-    // the history, and any run still marked running was orphaned when the old
-    // process died, so it can never finish. Mark them as errored on startup.
+    // Reconcile runs left unfinished by a previous crash: this process now owns
+    // the history, and any run still marked pending or running was orphaned
+    // when the old process died, so it can never start or finish. Mark them as
+    // errored on startup.
     const orphaned = this.#store.failRunning();
     if (orphaned > 0) {
-      this.#log(`Marked ${orphaned} orphaned running job(s) as errored`);
+      this.#log(`Marked ${orphaned} orphaned job(s) as errored`);
     }
     this.#run = options.run ?? (async (dir, onReport, signal) => {
       const config = await loadConfig(resolve(dir, this.#configFile));
@@ -389,12 +399,15 @@ export class CiServer {
     await new Promise<void>((resolvePromise) => {
       this.#server.close(() => resolvePromise());
     });
-    for (const event of this.#queue.splice(0)) {
+    for (const { event, runId } of this.#queue.splice(0)) {
       this.#log(
         `CI dropped at shutdown: ${event.repo} ${event.branch}@${
           event.sha.slice(0, 12)
         }`,
       );
+      // The run was recorded as pending when it was queued; close it out so it
+      // does not sit pending on the dashboard forever.
+      this.#store.finish(runId, "error");
       this.#track(
         this.#report(
           event.repo,
@@ -607,31 +620,41 @@ export class CiServer {
   }
 
   /**
-   * Accept a commit for testing: append it to the queue and start it if nothing
-   * is running. A commit that has to wait gets a `pending` status right away,
-   * since otherwise its check would show nothing at all for as long as the
-   * queue takes to reach it.
+   * Accept a commit for testing: record it, append it to the queue and start it
+   * if nothing is running. The run is recorded as `pending` here rather than
+   * when it starts, so a commit waiting behind another shows on the dashboard
+   * for the whole time it waits. A commit that has to wait also gets a
+   * `pending` commit status right away, since otherwise its check would show
+   * nothing at all for as long as the queue takes to reach it.
    */
   #enqueue(event: CiEvent): void {
+    const { repo, branch, sha, fetchRef } = event;
     const ahead = this.#queue.length + (this.#active === undefined ? 0 : 1);
-    this.#queue.push(event);
+    const runId = this.#store.queue({ branch, commit: sha, repo, fetchRef });
+    this.#queue.push({ event, runId });
     if (ahead > 0) {
       const runs = ahead === 1 ? "1 run" : `${ahead} runs`;
       this.#log(
-        `CI queued: ${event.repo} ${event.branch}@${
-          event.sha.slice(0, 12)
-        } (${runs} ahead)`,
+        `CI queued: ${repo} ${branch}@${sha.slice(0, 12)} (${runs} ahead)`,
       );
       this.#track(
         this.#report(
-          event.repo,
-          event.sha,
+          repo,
+          sha,
           "pending",
           `Queued for CI (${runs} ahead)`,
+          this.#runUrl(runId),
         ),
       );
     }
     this.#pump();
+  }
+
+  /** The dashboard URL of a run's report, when a public URL is configured. */
+  #runUrl(runId: number): string | undefined {
+    return this.#publicUrl === undefined
+      ? undefined
+      : `${this.#publicUrl}/runs/${runId}`;
   }
 
   /**
@@ -641,9 +664,9 @@ export class CiServer {
    */
   #pump(): void {
     if (this.#active !== undefined) return;
-    const event = this.#queue.shift();
-    if (event === undefined) return;
-    const job = this.#runJob(event)
+    const next = this.#queue.shift();
+    if (next === undefined) return;
+    const job = this.#runJob(next.event, next.runId)
       // #runJob reports its own failures; this only catches something thrown
       // around them (a broken run history, say), which must not wedge the queue.
       .catch((err: unknown) => {
@@ -668,7 +691,7 @@ export class CiServer {
    * git operation or pipeline in flight — the pipeline stops its containers on
    * the way out — and fails the commit, so the next queued commit can start.
    */
-  async #runJob(event: CiEvent): Promise<void> {
+  async #runJob(event: CiEvent, runId: number): Promise<void> {
     const { repo, branch, sha, fetchRef } = event;
     const short = sha.slice(0, 12);
     const worktreeDir = resolve(
@@ -677,13 +700,12 @@ export class CiServer {
     );
     this.#log(`CI start: ${repo} ${branch}@${short} -> ${worktreeDir}`);
 
-    // repo and fetchRef are recorded too, so this run can be repeated later
-    // from the dashboard without the original webhook.
-    const runId = this.#store.start({ branch, commit: sha, repo, fetchRef });
+    // The run was recorded when it was queued — repo and fetchRef included, so
+    // it can be repeated later from the dashboard without the original webhook;
+    // this only promotes it out of the queue.
+    this.#store.begin(runId);
     // Links GitHub's status "Details" straight to this run's report page.
-    const targetUrl = this.#publicUrl === undefined
-      ? undefined
-      : `${this.#publicUrl}/runs/${runId}`;
+    const targetUrl = this.#runUrl(runId);
     await this.#report(
       repo,
       sha,

@@ -97,6 +97,7 @@ function renderStep(step: StepReport): string {
 }
 
 const RUN_STATUS_LABEL: Record<RunStatus, string> = {
+  pending: "pending",
   running: "running",
   success: "passed",
   failure: "failed",
@@ -105,6 +106,7 @@ const RUN_STATUS_LABEL: Record<RunStatus, string> = {
 
 /** CSS badge class for a run's status, reusing the step badge palette. */
 const RUN_STATUS_CLASS: Record<RunStatus, string> = {
+  pending: "pending",
   running: "running",
   success: "success",
   failure: "failure",
@@ -127,9 +129,9 @@ export interface DashboardOptions {
 }
 
 /**
- * Render the server's front page: a table of recent runs (running ones
- * included), newest first, each showing its branch, start date and outcome and
- * linking to the stored HTML report when one exists. A logged-in operator also
+ * Render the server's front page: a table of recent runs (queued and running
+ * ones included), newest first, each showing its branch, start date and outcome
+ * and linking to the stored HTML report when one exists. A logged-in operator also
  * gets a **rerun** button on every failed run, which posts back to
  * `/runs/<id>/rerun` to queue the same commit again.
  */
@@ -190,7 +192,11 @@ function renderRunRow(run: RunRecord, canRerun: boolean): string {
   const commit = run.commit !== undefined
     ? ` <span class="muted">${escapeHtml(run.commit.slice(0, 12))}</span>`
     : "";
-  const duration = run.finishedAt !== undefined
+  // A queued run has not started, so it has no elapsed time to show yet; a
+  // running one has, but no total until it finishes.
+  const duration = run.status === "pending"
+    ? `<span class="muted">—</span>`
+    : run.finishedAt !== undefined
     ? formatDuration(run.finishedAt.getTime() - run.startedAt.getTime())
     : "…";
   const report = run.hasReport

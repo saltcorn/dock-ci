@@ -734,7 +734,7 @@ test("the job timeout defaults to 30 minutes", () => {
 
 test("shutting down drops queued commits and reports them", async () => {
   const first = gate();
-  const { server, status, runDirs } = await startServer(async () => {
+  const { server, status, store, runDirs } = await startServer(async () => {
     await first.wait;
     return { ok: true };
   });
@@ -742,6 +742,7 @@ test("shutting down drops queued commits and reports them", async () => {
     await postWebhook(server, "push", PUSH);
     await postWebhook(server, "push", OTHER_PUSH);
     await new Promise((r) => setTimeout(r, 50));
+    assert.equal(store.run(2)?.status, "pending");
 
     // close() waits for the running job, so let it finish once it is under way.
     const closed = server.close();
@@ -754,6 +755,8 @@ test("shutting down drops queued commits and reports them", async () => {
     const dropped = status.reports.filter((r) => r.sha === OTHER_PUSH.after);
     assert.equal(dropped.at(-1)?.state, "error");
     assert.match(dropped.at(-1)?.description ?? "", /shut down/);
+    // Its recorded run is closed out too, rather than left pending forever.
+    assert.equal(store.run(2)?.status, "error");
   } finally {
     await server.close();
   }
@@ -907,6 +910,70 @@ test("the dashboard shows a job that is still running, without a report link", a
     html = await (await fetch(`http://127.0.0.1:${server.port}/`)).text();
     assert.match(html, /failed/);
     assert.match(html, /href="\/runs\/1"/);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a run held in the queue is listed as pending until it starts", async () => {
+  const first = gate();
+  const { server, store } = await startServer(async () => {
+    await first.wait;
+    return { ok: true, report: "<html>done</html>" };
+  });
+  try {
+    await postWebhook(server, "push", PUSH);
+    await postWebhook(server, "push", OTHER_PUSH);
+    // Let the first commit reach the blocked run(), leaving the second queued.
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(server.queued, 1);
+
+    // Both runs are on the dashboard already: the one under way and the one
+    // waiting behind it, newest first.
+    assert.deepEqual(store.recent().map((run) => run.status), [
+      "pending",
+      "running",
+    ]);
+    const html = await (await fetch(`http://127.0.0.1:${server.port}/`)).text();
+    assert.match(html, /class="badge pending">pending/);
+    assert.match(html, /class="badge running">running/);
+    // A queued run has no elapsed time yet, unlike the running one.
+    assert.equal(html.match(/…/g)?.length, 1);
+
+    first.release();
+    await server.drain();
+    assert.deepEqual(store.recent().map((run) => run.status), [
+      "success",
+      "success",
+    ]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a queued run's start time excludes the time it spent waiting", async () => {
+  const first = gate();
+  const { server, store } = await startServer(async () => {
+    await first.wait;
+    return { ok: true, report: "<html>done</html>" };
+  });
+  try {
+    await postWebhook(server, "push", PUSH);
+    await postWebhook(server, "push", OTHER_PUSH);
+    await new Promise((r) => setTimeout(r, 50));
+    const queuedAt = store.run(2)?.startedAt.getTime() ?? 0;
+
+    first.release();
+    await server.drain();
+    const run = store.run(2);
+    assert.equal(run?.status, "success");
+    // It was restamped when it actually began, so its recorded duration is the
+    // run itself and not the run plus the wait behind the first commit.
+    assert.ok((run?.startedAt.getTime() ?? 0) >= queuedAt);
+    assert.ok(
+      (run?.finishedAt?.getTime() ?? 0) - (run?.startedAt.getTime() ?? 0) <
+        Date.now() - queuedAt,
+    );
   } finally {
     await server.close();
   }

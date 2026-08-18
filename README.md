@@ -289,8 +289,10 @@ what you are trusting them with.
 The server also serves a small dashboard:
 
 * `/` lists the recent runs from the [run history](#run-history), newest
-  first — still-running ones included — showing each run's branch, start date
-  and outcome (pass/fail), with a link to its HTML report.
+  first — queued and still-running ones included — showing each run's branch,
+  start date and outcome (pass/fail), with a link to its HTML report. A commit
+  waiting behind the one being built shows as **pending** from the moment it is
+  accepted, and turns to **running** when its turn comes.
 * `/runs/<id>` serves the stored HTML report of a run. The report is written the
   moment a run starts, with every step marked **pending**, and is rewritten as
   each step finishes — so reloading the page shows progress as it happens, even
@@ -334,7 +336,11 @@ what makes a busy server grind to a halt.
 
 A queued commit is given a `pending` commit status as soon as it is accepted,
 described as `Queued for CI (N runs ahead)`, so its check does not sit blank
-while it waits.
+while it waits. It is recorded in the run history at the same moment, as a
+**pending** run, so the dashboard shows the whole backlog rather than only the
+commit currently being built. Its recorded duration covers the run itself: the
+clock starts when the commit reaches the front of the queue, not when it joined
+it.
 
 Each job — the fetch, the checkout and the whole pipeline — is bounded by
 `--job-timeout`, 30 minutes by default. On expiry the run is aborted: every
@@ -345,8 +351,8 @@ hold the queue, and every commit behind it, closed indefinitely.
 
 On Ctrl-C the server stops listening and waits for the commit being tested to
 finish. Commits still on the queue are **not** built — waiting for a full queue
-could take hours — and are reported as `error` so their checks do not stay
-pending; push them again once the server is back.
+could take hours — and are reported as `error`, in the run history as well as on
+their checks, so neither stays pending; push them again once the server is back.
 
 The server is configured entirely through environment variables:
 
@@ -650,9 +656,11 @@ new `GITHUB_TOKEN`, `WEBHOOK_SECRET` or `ADMIN_PASSWORD`, edit
 # Run history
 
 Every run — one-shot CLI runs and webhook-triggered server runs alike — is
-recorded in an SQLite database (using Node's built-in `node:sqlite`). A run is
-inserted as `running` when it starts and updated with its outcome (`success`,
-`failure` or `error`) when it finishes. A server run's self-contained HTML
+recorded in an SQLite database (using Node's built-in `node:sqlite`). A server
+run is inserted as `pending` when its commit is queued and moves to `running`
+when it begins; a one-shot CLI run is inserted as `running` straight away. Both
+are updated with their outcome (`success`, `failure` or `error`) when they
+finish. A server run's self-contained HTML
 report is stored as soon as the run starts (all steps pending) and rewritten in
 place as each step finishes, so it is available while the run is still in flight;
 a one-shot CLI run stores its report once, at the end. The server's dashboard at
@@ -672,3 +680,7 @@ a failed server run be [rerun from the dashboard](#rerunning-a-failed-run)
 later. A database written by an earlier version gains those two columns the
 first time this version opens it; the runs already in it keep their reports but
 cannot be rerun, having never recorded where they came from.
+
+Starting the server reconciles any run left unfinished — `pending` or `running`
+— by a previous process: it can never start or finish now that the process which
+owned it is gone, so it is marked `error` rather than sitting unfinished forever.

@@ -3,8 +3,17 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-/** Lifecycle state of a recorded run. `running` rows have not finished yet. */
-export type RunStatus = "running" | "success" | "failure" | "error";
+/**
+ * Lifecycle state of a recorded run. `pending` is a run the server has accepted
+ * but not begun — it is waiting in the queue behind the one being tested —
+ * and `running` is the one under way; neither has finished yet.
+ */
+export type RunStatus =
+  | "pending"
+  | "running"
+  | "success"
+  | "failure"
+  | "error";
 
 /** One recorded CI run, past or still in flight. */
 export interface RunRecord {
@@ -26,6 +35,10 @@ export interface RunRecord {
    */
   fetchRef?: string;
   status: RunStatus;
+  /**
+   * When the run entered the history: the moment it was queued while it is
+   * still `pending`, and the moment it actually began once it starts running.
+   */
   startedAt: Date;
   /** Unset while the run is still in flight. */
   finishedAt?: Date;
@@ -43,7 +56,8 @@ export type RerunnableRun = RunRecord & {
 
 /**
  * Whether a run can be started again from the dashboard: it has to have failed
- * (a passing run has nothing to retry, and a running one is already under way),
+ * (a passing run has nothing to retry, and a queued or running one is already
+ * under way),
  * and the history has to remember enough about it to rebuild the same commit —
  * which runs recorded by the one-shot CLI, and runs from before the rerun
  * button existed, do not.
@@ -89,6 +103,19 @@ export interface RunHistory {
     run: { branch?: string; commit?: string; repo?: string; fetchRef?: string },
   ): number;
   /**
+   * Record a run that has been accepted but not started, returning its id. The
+   * server calls this as soon as it queues a commit, so a run waiting behind
+   * another shows on the dashboard instead of appearing only once it begins.
+   */
+  queue(
+    run: { branch?: string; commit?: string; repo?: string; fetchRef?: string },
+  ): number;
+  /**
+   * Promote a queued run to `running`, restamping its start time so its
+   * recorded duration covers the run itself and not the wait before it.
+   */
+  begin(id: number): void;
+  /**
    * Overwrite a still-running run's stored HTML report, leaving its status and
    * timestamps untouched. A server calls this repeatedly as steps finish so the
    * report served at `/runs/<id>` updates while the run is in flight.
@@ -96,9 +123,9 @@ export interface RunHistory {
   update(id: number, report: string): void;
   finish(id: number, status: RunStatus, report?: string): void;
   /**
-   * Mark every still-`running` run as `error`, returning how many were changed.
-   * Used on server startup to clear runs orphaned by a previous crash, which
-   * would otherwise show as running forever.
+   * Mark every unfinished run — queued or running — as `error`, returning how
+   * many were changed. Used on server startup to clear runs orphaned by a
+   * previous crash, which would otherwise sit unfinished forever.
    */
   failRunning(): number;
   recent(limit?: number): RunRecord[];
@@ -110,8 +137,9 @@ export interface RunHistory {
 /**
  * Persistent history of CI runs, backed by an SQLite database (via node's
  * built-in `node:sqlite`). Every run — one-shot CLI runs and webhook-triggered
- * server runs alike — is recorded here, first as `running` when it starts and
- * then with its final status and HTML report when it finishes. Pass
+ * server runs alike — is recorded here: a server run first as `pending` when it
+ * is queued and `running` once it begins, a one-shot run as `running` straight
+ * away, and both with their final status and HTML report when they finish. Pass
  * `":memory:"` as the path for a throwaway in-memory store (used in tests).
  */
 export class RunStore implements RunHistory {
@@ -162,19 +190,49 @@ export class RunStore implements RunHistory {
   start(
     run: { branch?: string; commit?: string; repo?: string; fetchRef?: string },
   ): number {
+    return this.#insert(run, "running");
+  }
+
+  /** Record a run that is queued but not started, returning its id. */
+  queue(
+    run: { branch?: string; commit?: string; repo?: string; fetchRef?: string },
+  ): number {
+    return this.#insert(run, "pending");
+  }
+
+  #insert(
+    run: { branch?: string; commit?: string; repo?: string; fetchRef?: string },
+    status: "pending" | "running",
+  ): number {
     const result = this.#db
       .prepare(
         `INSERT INTO runs (branch, commit_sha, repo, fetch_ref, status, started_at)
-         VALUES (?, ?, ?, ?, 'running', ?)`,
+         VALUES (?, ?, ?, ?, ?, ?)`,
       )
       .run(
         run.branch ?? null,
         run.commit ?? null,
         run.repo ?? null,
         run.fetchRef ?? null,
+        status,
         Date.now(),
       );
     return Number(result.lastInsertRowid);
+  }
+
+  /**
+   * Promote a queued run to `running` and restamp its start time, so the
+   * duration the dashboard shows is the run itself rather than the run plus
+   * however long it sat in the queue. Only a `pending` run is touched: a run
+   * that somehow already started or finished keeps the times it has.
+   */
+  begin(id: number): void {
+    this.#db
+      .prepare(
+        `UPDATE runs SET status = 'running', started_at = ?
+         WHERE id = ? AND status = 'pending'`,
+      )
+      .run(Date.now(), id);
   }
 
   /**
@@ -198,16 +256,18 @@ export class RunStore implements RunHistory {
   }
 
   /**
-   * Mark every run still recorded as `running` as `error`, stamping it with the
-   * current time as its finish time. A server calls this at startup to reconcile
-   * runs left dangling by a previous crash: the process that owned them is gone,
-   * so they can never finish and would otherwise show as running indefinitely.
+   * Mark every unfinished run — one still `pending` in a queue as well as the
+   * one that was `running` — as `error`, stamping it with the current time as
+   * its finish time. A server calls this at startup to reconcile runs left
+   * dangling by a previous crash: the process that owned them is gone, so they
+   * can never start or finish and would otherwise sit unfinished indefinitely.
    * Returns the number of runs updated.
    */
   failRunning(): number {
     const result = this.#db
       .prepare(
-        "UPDATE runs SET status = 'error', finished_at = ? WHERE status = 'running'",
+        `UPDATE runs SET status = 'error', finished_at = ?
+         WHERE status IN ('pending', 'running')`,
       )
       .run(Date.now());
     return Number(result.changes);
@@ -218,12 +278,16 @@ export class RunStore implements RunHistory {
     `id, branch, commit_sha, repo, fetch_ref, status, started_at, finished_at,
      report IS NOT NULL AS has_report`;
 
-  /** The most recent runs (running ones included), newest first. */
+  /**
+   * The most recent runs (queued and running ones included), newest first.
+   * Ordered by id — the order runs arrived in — rather than by start time,
+   * which {@link begin} restamps: ordering by the latter would let a run that
+   * has just started jump above the ones queued after it.
+   */
   recent(limit = 50): RunRecord[] {
     const rows = this.#db
       .prepare(
-        `SELECT ${RunStore.#COLUMNS}
-         FROM runs ORDER BY started_at DESC, id DESC LIMIT ?`,
+        `SELECT ${RunStore.#COLUMNS} FROM runs ORDER BY id DESC LIMIT ?`,
       )
       .all(limit) as RunRow[];
     return rows.map(toRecord);

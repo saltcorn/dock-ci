@@ -90,13 +90,15 @@ test("a run without a branch or report is handled", () => {
   store.close();
 });
 
-test("failRunning marks only still-running runs as errored, leaving finished ones", () => {
+test("failRunning marks unfinished runs as errored, leaving finished ones", () => {
   const store = new RunStore(":memory:");
   const running1 = store.start({ branch: "main" });
-  const running2 = store.start({ branch: "dev" });
+  const running2 = store.queue({ branch: "dev" });
   const finished = store.start({ branch: "old" });
   store.finish(finished, "success", "<html>ok</html>");
 
+  // A run still waiting in a queue is orphaned by a crash just as surely as
+  // the one that was running.
   assert.equal(store.failRunning(), 2);
 
   const byId = new Map(store.recent().map((r) => [r.id, r]));
@@ -109,6 +111,59 @@ test("failRunning marks only still-running runs as errored, leaving finished one
 
   // With nothing left running a second call is a no-op.
   assert.equal(store.failRunning(), 0);
+  store.close();
+});
+
+test("a queued run is recorded as pending until it begins", () => {
+  const store = new RunStore(":memory:");
+  const id = store.queue({
+    branch: "main",
+    commit: "abc123",
+    repo: "owner/repo",
+    fetchRef: "refs/heads/main",
+  });
+
+  const queued = store.run(id)!;
+  assert.equal(queued.status, "pending");
+  assert.equal(queued.branch, "main");
+  assert.equal(queued.commit, "abc123");
+  assert.equal(queued.finishedAt, undefined);
+  assert.equal(queued.hasReport, false);
+  // A run that has not started yet has nothing to retry.
+  assert.equal(isRerunnable(queued), false);
+
+  store.begin(id);
+  assert.equal(store.run(id)!.status, "running");
+  assert.ok(store.run(id)!.startedAt.getTime() >= queued.startedAt.getTime());
+
+  store.finish(id, "success", "<html>ok</html>");
+  assert.equal(store.run(id)!.status, "success");
+  store.close();
+});
+
+test("begin only promotes a run that is still queued", () => {
+  const store = new RunStore(":memory:");
+  const finished = store.queue({ branch: "main" });
+  store.finish(finished, "failure");
+  const startedAt = store.run(finished)!.startedAt;
+
+  store.begin(finished);
+
+  // A finished run is not dragged back to running by a stray promotion.
+  assert.equal(store.run(finished)!.status, "failure");
+  assert.deepEqual(store.run(finished)!.startedAt, startedAt);
+  store.close();
+});
+
+test("recent lists runs in arrival order, restamped starts included", () => {
+  const store = new RunStore(":memory:");
+  const first = store.queue({ branch: "one" });
+  const second = store.queue({ branch: "two" });
+  // The first run starts after the second was queued, so its start time is now
+  // the later of the two; arrival order still decides the listing.
+  store.begin(first);
+
+  assert.deepEqual(store.recent().map((run) => run.id), [second, first]);
   store.close();
 });
 
