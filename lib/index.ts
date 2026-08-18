@@ -5,6 +5,19 @@ export {
   resolveDockerfileBases,
   restrictToStep,
 } from "./config.ts";
+export {
+  checkCredentials,
+  createSession,
+  DEFAULT_ADMIN_USERNAME,
+  parseBasicAuth,
+  parseCookies,
+  readSession,
+  SESSION_COOKIE,
+  SESSION_TTL_MS,
+  sessionCookieHeader,
+  sessionKey,
+} from "./auth.ts";
+export type { AuthConfig, BasicCredentials } from "./auth.ts";
 export { dumpEvaluatedConfig, type Shell } from "./dump.ts";
 export {
   buildArgs,
@@ -34,9 +47,24 @@ export {
 } from "./incus.ts";
 export type { IncusClient, IncusLaunchOptions } from "./incus.ts";
 export { formatDuration, renderDashboard, renderReport } from "./report.ts";
-export type { ReportMeta, StepReport, StepStatus } from "./report.ts";
-export { dataDir, defaultDatabasePath, RunStore } from "./history.ts";
-export type { RunHistory, RunRecord, RunStatus } from "./history.ts";
+export type {
+  DashboardOptions,
+  ReportMeta,
+  StepReport,
+  StepStatus,
+} from "./report.ts";
+export {
+  dataDir,
+  defaultDatabasePath,
+  isRerunnable,
+  RunStore,
+} from "./history.ts";
+export type {
+  RerunnableRun,
+  RunHistory,
+  RunRecord,
+  RunStatus,
+} from "./history.ts";
 export { prerequisites, runScheduled } from "./schedule.ts";
 export { dependentsOf, runPipeline } from "./runner.ts";
 export type { PipelineResult, RunnerOptions } from "./runner.ts";
@@ -65,6 +93,7 @@ export type {
 } from "./github.ts";
 export {
   CiServer,
+  rerunEvent,
   serverConfigFromEnv,
   verifyCheckout,
 } from "./server.ts";

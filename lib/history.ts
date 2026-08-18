@@ -13,12 +13,45 @@ export interface RunRecord {
   branch?: string;
   /** Commit sha the run was for, when known. */
   commit?: string;
+  /**
+   * `owner/repo` the run's commit statuses were posted to. Only set for runs
+   * started by the server from a webhook; a one-shot CLI run has no repository
+   * recorded. Together with {@link fetchRef} it is what makes a run repeatable.
+   */
+  repo?: string;
+  /**
+   * The ref the commit was fetched from — a branch for a push, or
+   * `refs/pull/<n>/head` for a pull request. Recorded so the run can be
+   * repeated later: the commit may no longer be reachable by branch name.
+   */
+  fetchRef?: string;
   status: RunStatus;
   startedAt: Date;
   /** Unset while the run is still in flight. */
   finishedAt?: Date;
   /** Whether a stored HTML report is available via {@link RunStore.report}. */
   hasReport: boolean;
+}
+
+/** A run the history remembers enough about to build its commit again. */
+export type RerunnableRun = RunRecord & {
+  repo: string;
+  branch: string;
+  commit: string;
+  fetchRef: string;
+};
+
+/**
+ * Whether a run can be started again from the dashboard: it has to have failed
+ * (a passing run has nothing to retry, and a running one is already under way),
+ * and the history has to remember enough about it to rebuild the same commit —
+ * which runs recorded by the one-shot CLI, and runs from before the rerun
+ * button existed, do not.
+ */
+export function isRerunnable(run: RunRecord): run is RerunnableRun {
+  return (run.status === "failure" || run.status === "error") &&
+    run.repo !== undefined && run.branch !== undefined &&
+    run.commit !== undefined && run.fetchRef !== undefined;
 }
 
 /**
@@ -52,7 +85,9 @@ export function defaultDatabasePath(): string {
  * {@link RunStore} and fakeable in tests.
  */
 export interface RunHistory {
-  start(run: { branch?: string; commit?: string }): number;
+  start(
+    run: { branch?: string; commit?: string; repo?: string; fetchRef?: string },
+  ): number;
   /**
    * Overwrite a still-running run's stored HTML report, leaving its status and
    * timestamps untouched. A server calls this repeatedly as steps finish so the
@@ -67,6 +102,8 @@ export interface RunHistory {
    */
   failRunning(): number;
   recent(limit?: number): RunRecord[];
+  /** One run by id, or undefined when there is no such run. */
+  run(id: number): RunRecord | undefined;
   report(id: number): string | undefined;
 }
 
@@ -90,6 +127,8 @@ export class RunStore implements RunHistory {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         branch TEXT,
         commit_sha TEXT,
+        repo TEXT,
+        fetch_ref TEXT,
         status TEXT NOT NULL DEFAULT 'running',
         started_at INTEGER NOT NULL,
         finished_at INTEGER,
@@ -97,15 +136,44 @@ export class RunStore implements RunHistory {
       );
       CREATE INDEX IF NOT EXISTS runs_started_at ON runs (started_at);
     `);
+    this.#migrate();
+  }
+
+  /**
+   * Add columns introduced after a database was first created. `repo` and
+   * `fetch_ref` came with the rerun button, so a history written by an earlier
+   * version has neither; the rows already there stay NULL and are simply not
+   * rerunnable.
+   */
+  #migrate(): void {
+    const existing = new Set(
+      (this.#db.prepare("PRAGMA table_info(runs)").all() as Array<
+        { name: string }
+      >).map((column) => column.name),
+    );
+    for (const column of ["repo", "fetch_ref"]) {
+      if (!existing.has(column)) {
+        this.#db.exec(`ALTER TABLE runs ADD COLUMN ${column} TEXT`);
+      }
+    }
   }
 
   /** Record the start of a run, returning its id for the later finish call. */
-  start(run: { branch?: string; commit?: string }): number {
+  start(
+    run: { branch?: string; commit?: string; repo?: string; fetchRef?: string },
+  ): number {
     const result = this.#db
       .prepare(
-        "INSERT INTO runs (branch, commit_sha, status, started_at) VALUES (?, ?, 'running', ?)",
+        `INSERT INTO runs (branch, commit_sha, repo, fetch_ref, status, started_at)
+         VALUES (?, ?, ?, ?, 'running', ?)`,
       )
-      .run(run.branch ?? null, run.commit ?? null, Date.now());
+      .run(
+        run.branch ?? null,
+        run.commit ?? null,
+        run.repo ?? null,
+        run.fetchRef ?? null,
+        Date.now(),
+      );
     return Number(result.lastInsertRowid);
   }
 
@@ -145,34 +213,28 @@ export class RunStore implements RunHistory {
     return Number(result.changes);
   }
 
+  /** The columns {@link toRecord} maps, shared by the row queries below. */
+  static readonly #COLUMNS =
+    `id, branch, commit_sha, repo, fetch_ref, status, started_at, finished_at,
+     report IS NOT NULL AS has_report`;
+
   /** The most recent runs (running ones included), newest first. */
   recent(limit = 50): RunRecord[] {
     const rows = this.#db
       .prepare(
-        `SELECT id, branch, commit_sha, status, started_at, finished_at,
-                report IS NOT NULL AS has_report
+        `SELECT ${RunStore.#COLUMNS}
          FROM runs ORDER BY started_at DESC, id DESC LIMIT ?`,
       )
-      .all(limit) as Array<{
-        id: number;
-        branch: string | null;
-        commit_sha: string | null;
-        status: string;
-        started_at: number;
-        finished_at: number | null;
-        has_report: number;
-      }>;
-    return rows.map((row) => ({
-      id: row.id,
-      branch: row.branch ?? undefined,
-      commit: row.commit_sha ?? undefined,
-      status: row.status as RunStatus,
-      startedAt: new Date(row.started_at),
-      finishedAt: row.finished_at === null
-        ? undefined
-        : new Date(row.finished_at),
-      hasReport: row.has_report !== 0,
-    }));
+      .all(limit) as RunRow[];
+    return rows.map(toRecord);
+  }
+
+  /** One run by id, or undefined when no run has that id. */
+  run(id: number): RunRecord | undefined {
+    const row = this.#db
+      .prepare(`SELECT ${RunStore.#COLUMNS} FROM runs WHERE id = ?`)
+      .get(id) as RunRow | undefined;
+    return row === undefined ? undefined : toRecord(row);
   }
 
   /** The stored HTML report for a run, or undefined when there is none. */
@@ -186,4 +248,38 @@ export class RunStore implements RunHistory {
   close(): void {
     this.#db.close();
   }
+}
+
+/**
+ * One row of the `runs` table, as the queries above select it. A type alias
+ * rather than an interface so it stays assignable from node:sqlite's
+ * `Record<string, SQLOutputValue>` row type.
+ */
+type RunRow = {
+  id: number;
+  branch: string | null;
+  commit_sha: string | null;
+  repo: string | null;
+  fetch_ref: string | null;
+  status: string;
+  started_at: number;
+  finished_at: number | null;
+  has_report: number;
+};
+
+/** Convert a database row into the {@link RunRecord} callers see. */
+function toRecord(row: RunRow): RunRecord {
+  return {
+    id: row.id,
+    branch: row.branch ?? undefined,
+    commit: row.commit_sha ?? undefined,
+    repo: row.repo ?? undefined,
+    fetchRef: row.fetch_ref ?? undefined,
+    status: row.status as RunStatus,
+    startedAt: new Date(row.started_at),
+    finishedAt: row.finished_at === null
+      ? undefined
+      : new Date(row.finished_at),
+    hasReport: row.has_report !== 0,
+  };
 }

@@ -3,7 +3,8 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { test } from "node:test";
-import { dataDir, RunStore } from "../lib/history.ts";
+import { DatabaseSync } from "node:sqlite";
+import { dataDir, isRerunnable, type RunRecord, RunStore } from "../lib/history.ts";
 
 test("dataDir picks the customary per-platform application data directory", () => {
   assert.equal(
@@ -144,4 +145,102 @@ test("runs persist across reopening the database file", () => {
   assert.equal(run.status, "success");
   assert.equal(reopened.report(id), "<html>persisted</html>");
   reopened.close();
+});
+
+test("a run records the repository and ref needed to rerun it", () => {
+  const store = new RunStore(":memory:");
+  const id = store.start({
+    branch: "feature/x",
+    commit: "abc123",
+    repo: "owner/repo",
+    fetchRef: "refs/pull/7/head",
+  });
+
+  const run = store.run(id);
+  assert.ok(run);
+  assert.equal(run.repo, "owner/repo");
+  assert.equal(run.fetchRef, "refs/pull/7/head");
+  // The same fields come back from the dashboard listing.
+  assert.equal(store.recent()[0]?.fetchRef, "refs/pull/7/head");
+  // A run started without them (as the one-shot CLI does) has neither.
+  const bare = store.run(store.start({ branch: "main" }));
+  assert.equal(bare?.repo, undefined);
+  assert.equal(bare?.fetchRef, undefined);
+  store.close();
+});
+
+test("run() looks a single run up by id and is undefined for an unknown one", () => {
+  const store = new RunStore(":memory:");
+  const id = store.start({ branch: "main", commit: "abc" });
+  store.finish(id, "failure", "<html>failed</html>");
+
+  const run = store.run(id);
+  assert.equal(run?.id, id);
+  assert.equal(run?.status, "failure");
+  assert.equal(run?.hasReport, true);
+  assert.equal(store.run(id + 1), undefined);
+  store.close();
+});
+
+/** A finished run record, with the fields a test wants to vary overridden. */
+function record(over: Partial<RunRecord> = {}): RunRecord {
+  return {
+    id: 1,
+    branch: "main",
+    commit: "abc123",
+    repo: "owner/repo",
+    fetchRef: "main",
+    status: "failure",
+    startedAt: new Date(0),
+    finishedAt: new Date(1000),
+    hasReport: true,
+    ...over,
+  };
+}
+
+test("only a failed run that knows its repository and ref can be rerun", () => {
+  assert.equal(isRerunnable(record()), true);
+  // An `error` run failed too — a timeout or a git failure — and is repeatable.
+  assert.equal(isRerunnable(record({ status: "error" })), true);
+  // Nothing to retry about a run that passed, or one still under way.
+  assert.equal(isRerunnable(record({ status: "success" })), false);
+  assert.equal(isRerunnable(record({ status: "running" })), false);
+  // A CLI run, or one recorded before these columns existed, lacks the details.
+  assert.equal(isRerunnable(record({ repo: undefined })), false);
+  assert.equal(isRerunnable(record({ fetchRef: undefined })), false);
+  assert.equal(isRerunnable(record({ commit: undefined })), false);
+  assert.equal(isRerunnable(record({ branch: undefined })), false);
+});
+
+test("a database from an earlier version gains the rerun columns on open", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "whaleci-")), "runs.db");
+  // The pre-rerun schema, without the repo/fetch_ref columns.
+  const old = new DatabaseSync(path);
+  old.exec(`
+    CREATE TABLE runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      branch TEXT,
+      commit_sha TEXT,
+      status TEXT NOT NULL DEFAULT 'running',
+      started_at INTEGER NOT NULL,
+      finished_at INTEGER,
+      report TEXT
+    );
+  `);
+  old.prepare(
+    "INSERT INTO runs (branch, commit_sha, status, started_at) VALUES ('main', 'abc', 'failure', 1)",
+  ).run();
+  old.close();
+
+  // Opening it migrates in place, leaving the existing row readable but — with
+  // no repository recorded for it — not rerunnable.
+  const store = new RunStore(path);
+  const run = store.run(1);
+  assert.equal(run?.branch, "main");
+  assert.equal(run?.repo, undefined);
+  assert.equal(isRerunnable(run!), false);
+  // New runs can use the added columns.
+  const id = store.start({ branch: "x", commit: "d", repo: "o/r", fetchRef: "x" });
+  assert.equal(store.run(id)?.repo, "o/r");
+  store.close();
 });

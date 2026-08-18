@@ -282,6 +282,9 @@ The server also serves a small dashboard:
   each step finishes — so reloading the page shows progress as it happens, even
   though the report is not streamed. A run still in flight shows a **running**
   header; the final pass/fail verdict appears once it completes.
+* `/login` logs an operator in, so they can rerun a failed run — see
+  [Rerunning a failed run](#rerunning-a-failed-run).
+* `/runs/<id>/rerun` accepts the `POST` that the **rerun** button makes.
 
 Requests to any other path get a `404`.
 
@@ -354,6 +357,13 @@ The server is configured entirely through environment variables:
   `target_url` of `<PUBLIC_URL>/runs/<id>`, so the **Details** link next to the
   check in the GitHub pull request opens that run's report page. When unset,
   statuses are posted without a link (unchanged behaviour).
+* `ADMIN_PASSWORD` (optional): the password for the dashboard's operator login,
+  which is what unlocks the **rerun** button on a failed run. **Unset by
+  default, and there is no default value**: with no password set, `/login`
+  always fails and the dashboard stays read-only. See
+  [Rerunning a failed run](#rerunning-a-failed-run).
+* `ADMIN_USERNAME` (optional): the account name that goes with
+  `ADMIN_PASSWORD`. Defaults to `admin`.
 * `TRUSTED_PR_OWNERS` (optional): comma-separated GitHub account logins whose
   **fork** pull requests are built, e.g. `alice,bob`. Compared
   case-insensitively. Unset or empty — the default — builds no fork pull request
@@ -368,6 +378,7 @@ export WEBHOOK_SECRET=$(openssl rand -hex 20)
 export WORKTREE_ROOT=/var/tmp/whale-ci
 export LISTEN_PORT=8080
 export PUBLIC_URL=https://ci.example.com   # optional; links checks to reports
+export ADMIN_PASSWORD=$(openssl rand -hex 16)  # optional; enables /login
 export TRUSTED_PR_OWNERS=alice,bob         # optional; see the warning below
 npx whale-ci --serve ci.yml
 ```
@@ -381,6 +392,50 @@ already produced a `push` event that built the same commit, and building both
 would run every such commit twice. Press Ctrl-C to stop the server; it waits for
 the in-flight CI job to finish before exiting (see
 [One commit at a time](#one-commit-at-a-time)).
+
+## Rerunning a failed run
+
+A run that failed for a reason that has nothing to do with the commit — a flaky
+test, a registry that was briefly down, a network blip during a fetch — can be
+started again from the dashboard, without pushing anything or touching GitHub.
+The button reruns the **whole** run; individual steps cannot be rerun on their
+own, since a step's result depends on the images and services the steps before
+it built.
+
+Because a rerun executes the commit's pipeline on the CI host, it is behind a
+login:
+
+```sh
+export ADMIN_USERNAME=admin              # optional; this is the default
+export ADMIN_PASSWORD=$(openssl rand -hex 16)
+```
+
+Visiting `/login` produces the browser's own username/password dialog (HTTP
+Basic authentication). On a match the server sets an **encrypted session
+cookie** — AES-256-GCM, under a key derived from `ADMIN_PASSWORD` — and sends
+you back to the dashboard, where every failed run now carries a **rerun**
+button. The cookie is `HttpOnly`, `SameSite=Strict` (which is what stops another
+site from posting a rerun on your behalf), lasts 12 hours, and is marked
+`Secure` when `PUBLIC_URL` is an `https://` URL. Changing `ADMIN_PASSWORD`
+changes the key, so every session issued under the old password stops working.
+
+**If `ADMIN_PASSWORD` is not set there is no password at all** — no default, no
+fallback — and every login attempt fails, so the dashboard is exactly the
+read-only page it is without this feature. `ADMIN_USERNAME` alone is not enough
+to log in.
+
+Pressing **rerun** queues the run's commit exactly as a fresh webhook would: it
+joins the back of the queue, is built [one commit at a
+time](#one-commit-at-a-time) like any other, posts its own commit statuses, and
+is recorded as a **new** run in the history. The original run and its report are
+left untouched. The commit comes from the run history, not from the branch, so a
+rerun builds the commit that failed even if the branch has moved on since.
+
+The button appears only on runs the server can rebuild: a run that **failed**
+(status `failed` or `error` — a run that passed has nothing to retry, and a
+running one is already under way) and whose history records the repository and
+the ref to fetch it from. One-shot CLI runs and runs recorded by a whale-ci
+older than this feature carry neither, so they show a `—` instead.
 
 ## Fork pull requests (`TRUSTED_PR_OWNERS`)
 
@@ -509,13 +564,16 @@ WEBHOOK_SECRET=replace-me
 WORKTREE_ROOT=/var/lib/whale-ci/worktrees
 LISTEN_PORT=8080
 PUBLIC_URL=https://ci.example.com
+ADMIN_PASSWORD=replace-me
 EOF
 chown root:whaleci /etc/whale-ci.env
 chmod 640 /etc/whale-ci.env
 ```
 
 Generate a fresh webhook secret with `openssl rand -hex 20` and use the same
-value when you configure the webhook in GitHub.
+value when you configure the webhook in GitHub. `ADMIN_PASSWORD` is what unlocks
+the dashboard's [rerun button](#rerunning-a-failed-run); generate it with
+`openssl rand -hex 16`, or leave the line out to keep the dashboard read-only.
 
 Create the worktree root and hand it to the service user:
 
@@ -572,8 +630,8 @@ journalctl -u whale-ci.service -f
 The dashboard is now reachable at `http://<host>:8080/` and the webhook endpoint
 at `http://<host>:8080/webhook`. The run-history database is created under the
 service user's home at `/home/whaleci/.local/share/whale-ci/runs.db`. To apply a
-new `GITHUB_TOKEN` or `WEBHOOK_SECRET`, edit `/etc/whale-ci.env` and run
-`systemctl restart whale-ci.service`.
+new `GITHUB_TOKEN`, `WEBHOOK_SECRET` or `ADMIN_PASSWORD`, edit
+`/etc/whale-ci.env` and run `systemctl restart whale-ci.service`.
 
 # Run history
 
@@ -594,5 +652,9 @@ directory:
 * macOS: `~/Library/Application Support/whale-ci/runs.db`
 
 One-shot runs are tagged with the current git branch and commit when run from
-inside a git checkout; server runs are tagged with the pushed branch and
-commit.
+inside a git checkout; server runs are tagged with the pushed branch and commit,
+plus the repository and the ref the commit was fetched from — which is what lets
+a failed server run be [rerun from the dashboard](#rerunning-a-failed-run)
+later. A database written by an earlier version gains those two columns the
+first time this version opens it; the runs already in it keep their reports but
+cannot be rerun, having never recorded where they came from.

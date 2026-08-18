@@ -4,7 +4,8 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { CiServer, type CiServerOptions, DEFAULT_JOB_TIMEOUT_MINUTES, type JobResult, type RunJob, serverConfigFromEnv, verifyCheckout } from "../lib/server.ts";
+import { CiServer, type CiServerOptions, DEFAULT_JOB_TIMEOUT_MINUTES, type JobResult, rerunEvent, type RunJob, serverConfigFromEnv, verifyCheckout } from "../lib/server.ts";
+import { SESSION_COOKIE } from "../lib/auth.ts";
 import type { CommitState, StatusReporter } from "../lib/github.ts";
 import type { GitClient } from "../lib/git.ts";
 import { RunStore } from "../lib/history.ts";
@@ -183,7 +184,27 @@ test("serverConfigFromEnv reads and validates the four env vars", () => {
     publicUrl: undefined,
     // Unset TRUSTED_PR_OWNERS builds no fork pull request.
     trustedPrOwners: new Set(),
+    // The admin username has a default; the password deliberately has none.
+    auth: { username: "admin", password: undefined },
   });
+});
+
+test("serverConfigFromEnv reads the optional admin credentials", () => {
+  const base = {
+    GITHUB_TOKEN: "tok",
+    WEBHOOK_SECRET: "sec",
+    WORKTREE_ROOT: "/wt",
+    LISTEN_PORT: "8080",
+  };
+  assert.deepEqual(
+    serverConfigFromEnv({ ...base, ADMIN_USERNAME: " ci ", ADMIN_PASSWORD: "hunter2" }).auth,
+    { username: "ci", password: "hunter2" },
+  );
+  // A blank username falls back to the default; a blank password is no password.
+  assert.deepEqual(
+    serverConfigFromEnv({ ...base, ADMIN_USERNAME: "  ", ADMIN_PASSWORD: "" }).auth,
+    { username: "admin", password: undefined },
+  );
 });
 
 test("serverConfigFromEnv reads the optional TRUSTED_PR_OWNERS", () => {
@@ -901,4 +922,382 @@ test("a job that errors is recorded as an error in the run history", async () =>
   } finally {
     await server.close();
   }
+});
+
+/** The admin credentials the login tests use. */
+const ADMIN = { username: "admin", password: "hunter2" };
+
+/** GET /login with optional Basic credentials, never following the redirect. */
+async function login(
+  server: CiServer,
+  credentials?: { username: string; password: string },
+): Promise<Response> {
+  const headers: Record<string, string> = {};
+  if (credentials !== undefined) {
+    headers["authorization"] = "Basic " +
+      Buffer.from(`${credentials.username}:${credentials.password}`)
+        .toString("base64");
+  }
+  return await fetch(`http://127.0.0.1:${server.port}/login`, {
+    headers,
+    redirect: "manual",
+  });
+}
+
+/** Log in and return the session cookie to send on subsequent requests. */
+async function session(server: CiServer): Promise<string> {
+  const res = await login(server, ADMIN);
+  assert.equal(res.status, 303);
+  const cookie = res.headers.get("set-cookie");
+  assert.ok(cookie);
+  return cookie.split(";")[0]!;
+}
+
+/** POST a rerun of `id`, with the given session cookie when one is supplied. */
+async function postRerun(
+  server: CiServer,
+  id: number,
+  cookie?: string,
+): Promise<Response> {
+  return await fetch(`http://127.0.0.1:${server.port}/runs/${id}/rerun`, {
+    method: "POST",
+    headers: cookie === undefined ? {} : { cookie },
+    redirect: "manual",
+  });
+}
+
+test("GET /login challenges for Basic credentials when none are sent", async () => {
+  const { server } = await startServer(fixedRun(true), new FakeGit("/repo"), undefined, undefined, {
+    auth: ADMIN,
+  });
+  try {
+    const res = await login(server);
+    assert.equal(res.status, 401);
+    // The challenge header is what makes the browser show its login dialog.
+    assert.match(res.headers.get("www-authenticate") ?? "", /^Basic realm="whale-ci"/);
+    assert.equal(res.headers.get("set-cookie"), null);
+  } finally {
+    await server.close();
+  }
+});
+
+test("GET /login sets an encrypted session cookie for the right credentials", async () => {
+  const { server } = await startServer(fixedRun(true), new FakeGit("/repo"), undefined, undefined, {
+    auth: ADMIN,
+  });
+  try {
+    const res = await login(server, ADMIN);
+    assert.equal(res.status, 303);
+    assert.equal(res.headers.get("location"), "/");
+    const cookie = res.headers.get("set-cookie") ?? "";
+    assert.match(cookie, new RegExp(`^${SESSION_COOKIE}=`));
+    assert.match(cookie, /HttpOnly/);
+    assert.match(cookie, /SameSite=Strict/);
+    // Served over plain http here, so the cookie must not be Secure-only.
+    assert.doesNotMatch(cookie, /Secure/);
+    // The password is not echoed back into the cookie.
+    assert.doesNotMatch(cookie, /hunter2/);
+  } finally {
+    await server.close();
+  }
+});
+
+test("GET /login rejects a wrong username or password", async () => {
+  const { server } = await startServer(fixedRun(true), new FakeGit("/repo"), undefined, undefined, {
+    auth: ADMIN,
+  });
+  try {
+    for (
+      const bad of [
+        { username: "admin", password: "wrong" },
+        { username: "root", password: "hunter2" },
+      ]
+    ) {
+      const res = await login(server, bad);
+      assert.equal(res.status, 401);
+      assert.equal(res.headers.get("set-cookie"), null);
+    }
+  } finally {
+    await server.close();
+  }
+});
+
+test("with no password configured every login fails and the dashboard says so", async () => {
+  // The default construction: no ADMIN_PASSWORD, so there is nothing to log in
+  // with and no session can exist.
+  const { server } = await startServer(fixedRun(true));
+  try {
+    for (
+      const attempt of [
+        undefined,
+        { username: "admin", password: "" },
+        { username: "admin", password: "guess" },
+      ]
+    ) {
+      const res = await login(server, attempt);
+      assert.equal(res.status, 401);
+      assert.equal(res.headers.get("set-cookie"), null);
+    }
+    // The dashboard does not offer a login link that could never succeed.
+    const html = await (await fetch(`http://127.0.0.1:${server.port}/`)).text();
+    assert.match(html, /no ADMIN_PASSWORD is configured/);
+    assert.doesNotMatch(html, /href="\/login"/);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a POST to /login is not allowed", async () => {
+  const { server } = await startServer(fixedRun(true), new FakeGit("/repo"), undefined, undefined, {
+    auth: ADMIN,
+  });
+  try {
+    const res = await fetch(`http://127.0.0.1:${server.port}/login`, { method: "POST" });
+    assert.equal(res.status, 405);
+  } finally {
+    await server.close();
+  }
+});
+
+test("the rerun button is shown on failed runs only once logged in", async () => {
+  const { server } = await startServer(fixedRun(false), new FakeGit("/repo"), undefined, undefined, {
+    auth: ADMIN,
+  });
+  try {
+    await postWebhook(server, "push", PUSH);
+    await server.drain();
+
+    // Logged out, the dashboard is the read-only page it always was: it points
+    // at /login, but offers no button to post a rerun with.
+    const anonymous = await (await fetch(`http://127.0.0.1:${server.port}/`)).text();
+    assert.doesNotMatch(anonymous, /<form/);
+    assert.doesNotMatch(anonymous, /action="\/runs\/1\/rerun"/);
+    assert.match(anonymous, /href="\/login"/);
+
+    const cookie = await session(server);
+    const html = await (await fetch(`http://127.0.0.1:${server.port}/`, {
+      headers: { cookie },
+    })).text();
+    assert.match(html, /action="\/runs\/1\/rerun"/);
+    assert.match(html, /Signed in as admin/);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a passing run gets no rerun button even when logged in", async () => {
+  const { server } = await startServer(fixedRun(true), new FakeGit("/repo"), undefined, undefined, {
+    auth: ADMIN,
+  });
+  try {
+    await postWebhook(server, "push", PUSH);
+    await server.drain();
+    const cookie = await session(server);
+    const html = await (await fetch(`http://127.0.0.1:${server.port}/`, {
+      headers: { cookie },
+    })).text();
+    assert.doesNotMatch(html, /action="\/runs\/1\/rerun"/);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a logged-in rerun queues the same commit as a new run", async () => {
+  const { server, git, status, store } = await startServer(
+    fixedRun(false),
+    new FakeGit("/repo"),
+    undefined,
+    undefined,
+    { auth: ADMIN },
+  );
+  try {
+    await postWebhook(server, "push", PUSH);
+    await server.drain();
+    git.calls.length = 0;
+
+    const cookie = await session(server);
+    const res = await postRerun(server, 1, cookie);
+    // 303 so reloading the dashboard afterwards does not post the rerun again.
+    assert.equal(res.status, 303);
+    assert.equal(res.headers.get("location"), "/");
+    await server.drain();
+
+    // The same commit was fetched from the same ref and built again.
+    assert.ok(git.calls.some((c) => c === "fetch feature/x"));
+    assert.ok(git.calls.some((c) => c.startsWith(`add ${PUSH.after} `)));
+    // It is a run of its own, recorded alongside the original.
+    const runs = store.recent();
+    assert.equal(runs.length, 2);
+    assert.equal(runs[0]!.commit, PUSH.after);
+    assert.equal(runs[0]!.branch, "feature/x");
+    // GitHub is told about the rerun exactly as about any other run.
+    assert.deepEqual(status.states, ["pending", "failure", "pending", "failure"]);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a rerun of a fork pull request run refetches its pull ref", async () => {
+  const { server, git, store } = await startServer(
+    fixedRun(false),
+    new FakeGit("/repo"),
+    undefined,
+    new Set(["bob"]),
+    { auth: ADMIN },
+  );
+  try {
+    await postWebhook(server, "pull_request", FORK_PR);
+    await server.drain();
+    git.calls.length = 0;
+
+    await postRerun(server, 1, await session(server));
+    await server.drain();
+
+    // The head commit still only exists under the base repo's pull ref.
+    assert.ok(git.calls.some((c) => c === "fetch refs/pull/7/head"));
+    assert.equal(store.recent()[0]!.commit, "f0rkc0mm1t");
+  } finally {
+    await server.close();
+  }
+});
+
+test("a rerun without a valid session is refused and starts no job", async () => {
+  const { server, git, store } = await startServer(
+    fixedRun(false),
+    new FakeGit("/repo"),
+    undefined,
+    undefined,
+    { auth: ADMIN },
+  );
+  try {
+    await postWebhook(server, "push", PUSH);
+    await server.drain();
+    git.calls.length = 0;
+
+    // No cookie at all, and a forged one.
+    for (const cookie of [undefined, `${SESSION_COOKIE}=v1.a.b.c`]) {
+      const res = await postRerun(server, 1, cookie);
+      assert.equal(res.status, 401);
+    }
+    await server.drain();
+    assert.deepEqual(git.calls, []);
+    assert.equal(store.recent().length, 1);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a session issued under a previous password is no longer accepted", async () => {
+  const { server } = await startServer(fixedRun(false), new FakeGit("/repo"), undefined, undefined, {
+    auth: ADMIN,
+  });
+  let cookie: string;
+  try {
+    await postWebhook(server, "push", PUSH);
+    await server.drain();
+    cookie = await session(server);
+    assert.equal((await postRerun(server, 1, cookie)).status, 303);
+  } finally {
+    await server.close();
+  }
+
+  // Restarting with a different password invalidates the old cookie, because
+  // the key it was encrypted with is derived from the password.
+  const rotated = await startServer(fixedRun(false), new FakeGit("/repo"), undefined, undefined, {
+    auth: { username: "admin", password: "hunter3" },
+  });
+  try {
+    await postWebhook(rotated.server, "push", PUSH);
+    await rotated.server.drain();
+    assert.equal((await postRerun(rotated.server, 1, cookie)).status, 401);
+  } finally {
+    await rotated.server.close();
+  }
+});
+
+test("rerunning a passing, unknown or wrong-method run is refused", async () => {
+  const { server, git } = await startServer(
+    fixedRun(true),
+    new FakeGit("/repo"),
+    undefined,
+    undefined,
+    { auth: ADMIN },
+  );
+  try {
+    await postWebhook(server, "push", PUSH);
+    await server.drain();
+    git.calls.length = 0;
+    const cookie = await session(server);
+
+    // A run that passed has nothing to retry.
+    assert.equal((await postRerun(server, 1, cookie)).status, 409);
+    assert.equal((await postRerun(server, 99, cookie)).status, 404);
+    const wrongMethod = await fetch(`http://127.0.0.1:${server.port}/runs/1/rerun`, {
+      headers: { cookie },
+    });
+    assert.equal(wrongMethod.status, 405);
+
+    await server.drain();
+    assert.deepEqual(git.calls, []);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a rerun that arrives mid-run is queued behind it", async () => {
+  const first = gate();
+  let runs = 0;
+  const { server, store } = await startServer(
+    async () => {
+      runs++;
+      if (runs === 1) return { ok: false, report: "<html>failed</html>" };
+      await first.wait;
+      return { ok: false };
+    },
+    new FakeGit("/repo"),
+    undefined,
+    undefined,
+    { auth: ADMIN },
+  );
+  try {
+    await postWebhook(server, "push", PUSH);
+    await server.drain();
+    const cookie = await session(server);
+
+    // The second push occupies the runner, so the rerun has to wait its turn.
+    await postWebhook(server, "push", OTHER_PUSH);
+    await new Promise((r) => setTimeout(r, 50));
+    const res = await postRerun(server, 1, cookie);
+    assert.equal(res.status, 303);
+    assert.equal(server.queued, 1);
+
+    first.release();
+    await server.drain();
+    assert.equal(store.recent().length, 3);
+  } finally {
+    await server.close();
+  }
+});
+
+test("rerunEvent rebuilds the recorded commit, or refuses to", () => {
+  const store = new RunStore(":memory:");
+  const id = store.start({
+    branch: "feature/x",
+    commit: "deadbeef",
+    repo: "owner/repo",
+    fetchRef: "feature/x",
+  });
+  store.finish(id, "failure", "<html>failed</html>");
+  assert.deepEqual(rerunEvent(store.run(id)!), {
+    repo: "owner/repo",
+    branch: "feature/x",
+    sha: "deadbeef",
+    fetchRef: "feature/x",
+  });
+
+  // A one-shot CLI run knows no repository, so it cannot be repeated here.
+  const cli = store.start({ branch: "main", commit: "abc" });
+  store.finish(cli, "failure");
+  assert.equal(rerunEvent(store.run(cli)!), undefined);
+  store.close();
 });

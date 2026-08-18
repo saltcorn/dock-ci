@@ -98,7 +98,9 @@ export const app = command({
         "pushed commit out into its own git worktree and runs the pipeline. " +
         "Must be run from the root of the git checkout containing the config " +
         "file. Reads GITHUB_TOKEN, WEBHOOK_SECRET, WORKTREE_ROOT and " +
-        "LISTEN_PORT from the environment.",
+        "LISTEN_PORT from the environment, plus the optional ADMIN_USERNAME " +
+        "and ADMIN_PASSWORD that guard rerunning a failed run from the " +
+        "dashboard.",
     }),
     configFile: positional({
       type: string,
@@ -278,6 +280,7 @@ async function runServe(
       store,
       publicUrl: env.publicUrl,
       trustedPrOwners: env.trustedPrOwners,
+      auth: env.auth,
       jobTimeoutMinutes,
     });
 
@@ -288,6 +291,12 @@ async function runServe(
         `checkout ${repoRoot}, worktrees under ${env.worktreeRoot}, ` +
         `one commit at a time, ${jobTimeoutMinutes} minute job timeout)`,
     );
+    if (env.auth.password === undefined) {
+      console.error(
+        "ADMIN_PASSWORD is not set: /login always fails and the dashboard is " +
+          "read-only (no rerun buttons)",
+      );
+    }
 
     // Run until Ctrl-C, then stop listening and let the running job finish.
     await new Promise<void>((resolvePromise) => {

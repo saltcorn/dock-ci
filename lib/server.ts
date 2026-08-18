@@ -1,6 +1,19 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { existsSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
+import {
+  type AuthConfig,
+  checkCredentials,
+  createSession,
+  DEFAULT_ADMIN_USERNAME,
+  parseBasicAuth,
+  parseCookies,
+  readSession,
+  SESSION_COOKIE,
+  SESSION_TTL_MS,
+  sessionCookieHeader,
+  sessionKey,
+} from "./auth.ts";
 import { loadConfig } from "./config.ts";
 import { type GitClient, slugifyBranch } from "./git.ts";
 import {
@@ -11,7 +24,7 @@ import {
   type StatusReporter,
   verifySignature,
 } from "./github.ts";
-import type { RunHistory } from "./history.ts";
+import { isRerunnable, type RunHistory, type RunRecord } from "./history.ts";
 import { renderDashboard, renderReport, type StepReport } from "./report.ts";
 import { runPipeline } from "./runner.ts";
 import { ConfigError } from "./types.ts";
@@ -36,6 +49,12 @@ export interface ServerEnv {
    * `TRUSTED_PR_OWNERS`. Empty when unset, which builds no fork pull request.
    */
   trustedPrOwners: ReadonlySet<string>;
+  /**
+   * The operator account accepted at `/login`, from `ADMIN_USERNAME` (default
+   * `admin`) and `ADMIN_PASSWORD`. With no password set the login always fails
+   * and the dashboard stays read-only.
+   */
+  auth: AuthConfig;
 }
 
 /**
@@ -78,6 +97,20 @@ export function serverConfigFromEnv(
   // on this host, so none is built until an owner is named here.
   const trustedPrOwners = parseTrustedOwners(env["TRUSTED_PR_OWNERS"]);
 
+  // The dashboard's operator login. The username has a default; the password
+  // deliberately has none, so a server that was never given one cannot be
+  // logged into at all rather than shipping a well-known credential.
+  const usernameRaw = env["ADMIN_USERNAME"];
+  const passwordRaw = env["ADMIN_PASSWORD"];
+  const auth: AuthConfig = {
+    username: usernameRaw !== undefined && usernameRaw.trim() !== ""
+      ? usernameRaw.trim()
+      : DEFAULT_ADMIN_USERNAME,
+    password: passwordRaw !== undefined && passwordRaw !== ""
+      ? passwordRaw
+      : undefined,
+  };
+
   return {
     githubToken,
     webhookSecret,
@@ -85,6 +118,7 @@ export function serverConfigFromEnv(
     listenPort,
     publicUrl,
     trustedPrOwners,
+    auth,
   };
 }
 
@@ -171,6 +205,13 @@ export interface CiServerOptions {
    */
   trustedPrOwners?: ReadonlySet<string>;
   /**
+   * The operator account that may rerun failed runs from the dashboard.
+   * Defaults to the `admin` username with no password, which disables `/login`
+   * entirely: without a password nothing can authenticate, so the dashboard
+   * stays read-only exactly as it was before the rerun button existed.
+   */
+  auth?: AuthConfig;
+  /**
    * Build and run the pipeline for a worktree, resolving with the outcome and
    * the final HTML report and calling `onReport` with each interim report as the
    * run progresses. Defaults to loading `configFile` from the worktree and
@@ -220,6 +261,13 @@ export class CiServer {
   readonly #store: RunHistory;
   readonly #publicUrl?: string;
   readonly #trustedPrOwners: ReadonlySet<string>;
+  readonly #auth: AuthConfig;
+  /**
+   * Key session cookies are encrypted with, derived from the configured
+   * password. Undefined when no password is set — the state in which no session
+   * can be issued and none can be read.
+   */
+  readonly #sessionKey: Buffer | undefined;
   readonly #run: RunJob;
   readonly #jobTimeoutMinutes: number;
   readonly #timer: (ms: number, fire: () => void) => () => void;
@@ -248,6 +296,11 @@ export class CiServer {
     // Normalise away a trailing slash so `${publicUrl}/runs/<id>` is well-formed.
     this.#publicUrl = options.publicUrl?.replace(/\/+$/, "");
     this.#trustedPrOwners = options.trustedPrOwners ?? new Set();
+    this.#auth = options.auth ?? { username: DEFAULT_ADMIN_USERNAME };
+    this.#sessionKey = this.#auth.password === undefined ||
+        this.#auth.password === ""
+      ? undefined
+      : sessionKey(this.#auth.password);
     this.#jobTimeoutMinutes = options.jobTimeoutMinutes ??
       DEFAULT_JOB_TIMEOUT_MINUTES;
     this.#timer = options.timer ??
@@ -346,14 +399,32 @@ export class CiServer {
 
   /**
    * Route one request: the webhook on POST /webhook, the run dashboard on
-   * GET /, and stored run reports on GET /runs/<id>.
+   * GET /, stored run reports on GET /runs/<id>, the operator login on
+   * GET /login, and rerunning a failed run on POST /runs/<id>/rerun.
    */
   async #handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const path = (req.url ?? "/").split("?")[0] ?? "/";
 
     if (path === "/") {
       if (req.method !== "GET") return reply(res, 405, "Method Not Allowed");
-      return replyHtml(res, renderDashboard(this.#store.recent()));
+      return replyHtml(
+        res,
+        renderDashboard(this.#store.recent(), {
+          user: this.#session(req),
+          loginEnabled: this.#sessionKey !== undefined,
+        }),
+      );
+    }
+
+    if (path === "/login") {
+      if (req.method !== "GET") return reply(res, 405, "Method Not Allowed");
+      return this.#login(req, res);
+    }
+
+    const rerunId = path.match(/^\/runs\/(\d+)\/rerun$/);
+    if (rerunId !== null) {
+      if (req.method !== "POST") return reply(res, 405, "Method Not Allowed");
+      return this.#rerun(req, res, Number(rerunId[1]));
     }
 
     const runId = path.match(/^\/runs\/(\d+)$/);
@@ -412,6 +483,101 @@ export class CiServer {
 
     this.#enqueue(push);
     return reply(res, 202, "Accepted");
+  }
+
+  /**
+   * The logged-in operator's name for this request, or undefined when it
+   * carries no valid session cookie. Always undefined when no password is
+   * configured, since no key exists to have issued a session with.
+   */
+  #session(req: IncomingMessage): string | undefined {
+    if (this.#sessionKey === undefined) return undefined;
+    const cookie = parseCookies(header(req, "cookie")).get(SESSION_COOKIE);
+    return readSession(this.#sessionKey, cookie);
+  }
+
+  /**
+   * Handle `GET /login`. With no `Authorization` header — or with credentials
+   * that do not match — answer `401` carrying a `WWW-Authenticate: Basic`
+   * challenge, which is what makes the browser show its login dialog. On a
+   * match, set the encrypted session cookie and send the operator to the
+   * dashboard, where the rerun buttons are now shown.
+   *
+   * With no `ADMIN_PASSWORD` configured every attempt takes the failure path,
+   * so a server that was never given a password can never be logged into.
+   */
+  #login(req: IncomingMessage, res: ServerResponse): void {
+    const credentials = parseBasicAuth(header(req, "authorization"));
+    if (this.#sessionKey === undefined) {
+      this.#log("Rejected login: no ADMIN_PASSWORD is configured");
+      return challenge(
+        res,
+        "Login is not configured: set ADMIN_PASSWORD to enable it",
+      );
+    }
+    if (!checkCredentials(this.#auth, credentials)) {
+      // Logged without the attempted password, and without distinguishing a
+      // wrong username from a wrong password.
+      this.#log(
+        `Rejected login attempt${
+          credentials === undefined ? "" : ` for "${credentials.username}"`
+        }`,
+      );
+      return challenge(res, "Invalid credentials");
+    }
+
+    const cookie = createSession(
+      this.#sessionKey,
+      this.#auth.username,
+      Date.now() + SESSION_TTL_MS,
+    );
+    this.#log(`Logged in as ${this.#auth.username}`);
+    res.writeHead(303, {
+      "Location": "/",
+      "Set-Cookie": sessionCookieHeader(cookie, {
+        maxAgeSeconds: Math.floor(SESSION_TTL_MS / 1000),
+        // Over HTTPS, keep the cookie off any plaintext request. Left off when
+        // the dashboard is served over http, where it would make the session
+        // silently unusable.
+        secure: this.#publicUrl?.startsWith("https://") ?? false,
+      }),
+    });
+    res.end();
+  }
+
+  /**
+   * Handle `POST /runs/<id>/rerun`: queue the recorded run's commit for a fresh
+   * run, as though its webhook had just arrived again. Requires a session
+   * cookie — the button is only rendered for a logged-in operator, and this
+   * check is what actually enforces it. The new run is recorded as a run of its
+   * own; the original's report is left untouched.
+   */
+  #rerun(req: IncomingMessage, res: ServerResponse, id: number): void {
+    if (this.#session(req) === undefined) {
+      return reply(res, 401, "Log in at /login to rerun a run");
+    }
+    const run = this.#store.run(id);
+    if (run === undefined) return reply(res, 404, "No such run");
+    const event = rerunEvent(run);
+    if (event === undefined) {
+      return reply(
+        res,
+        409,
+        "This run cannot be rerun: only a failed run recorded by this server " +
+          "carries the repository and ref needed to build its commit again",
+      );
+    }
+
+    this.#log(
+      `Rerun of run ${id} requested: ${event.repo} ${event.branch}@${
+        event.sha.slice(0, 12)
+      }`,
+    );
+    this.#enqueue(event);
+    // 303 so the browser follows with a GET: reloading the dashboard afterwards
+    // must not post the rerun a second time.
+    res.writeHead(303, { "Location": "/" });
+    res.end();
   }
 
   /** Add a job to the in-flight set, removing it once it settles. */
@@ -491,7 +657,9 @@ export class CiServer {
     );
     this.#log(`CI start: ${repo} ${branch}@${short} -> ${worktreeDir}`);
 
-    const runId = this.#store.start({ branch, commit: sha });
+    // repo and fetchRef are recorded too, so this run can be repeated later
+    // from the dashboard without the original webhook.
+    const runId = this.#store.start({ branch, commit: sha, repo, fetchRef });
     // Links GitHub's status "Details" straight to this run's report page.
     const targetUrl = this.#publicUrl === undefined
       ? undefined
@@ -602,6 +770,34 @@ function readBody(req: IncomingMessage): Promise<string> {
 function header(req: IncomingMessage, name: string): string | undefined {
   const value = req.headers[name];
   return Array.isArray(value) ? value[0] : value;
+}
+
+/**
+ * The CI event that repeats a recorded run, or undefined when the run is not
+ * one that can be repeated — see {@link isRerunnable}. The commit is taken from
+ * the record, so a rerun builds exactly the commit that failed and not whatever
+ * the branch has moved on to.
+ */
+export function rerunEvent(run: RunRecord): CiEvent | undefined {
+  if (!isRerunnable(run)) return undefined;
+  return {
+    repo: run.repo,
+    branch: run.branch,
+    sha: run.commit,
+    fetchRef: run.fetchRef,
+  };
+}
+
+/**
+ * Answer with a `401` and a Basic challenge, which is what makes a browser pop
+ * up its username/password dialog for `/login`.
+ */
+function challenge(res: ServerResponse, text: string): void {
+  res.writeHead(401, {
+    "Content-Type": "text/plain",
+    "WWW-Authenticate": `Basic realm="whale-ci", charset="UTF-8"`,
+  });
+  res.end(text);
 }
 
 /** Send a plain-text response with the given status code. */

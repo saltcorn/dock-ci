@@ -1,4 +1,4 @@
-import type { RunRecord, RunStatus } from "./history.ts";
+import { isRerunnable, type RunRecord, type RunStatus } from "./history.ts";
 
 /**
  * State of a single step in a pipeline run. `pending` is a step that has not
@@ -111,17 +111,42 @@ const RUN_STATUS_CLASS: Record<RunStatus, string> = {
   error: "failure",
 };
 
+/** Who is viewing the dashboard, which decides whether it offers reruns. */
+export interface DashboardOptions {
+  /**
+   * The logged-in operator's name, when the request carried a valid session
+   * cookie. Only a logged-in viewer is offered the rerun button.
+   */
+  user?: string;
+  /**
+   * Whether logging in is possible at all — false when no `ADMIN_PASSWORD` is
+   * configured, in which case the page does not advertise a `/login` link that
+   * could never succeed.
+   */
+  loginEnabled?: boolean;
+}
+
 /**
  * Render the server's front page: a table of recent runs (running ones
  * included), newest first, each showing its branch, start date and outcome and
- * linking to the stored HTML report when one exists.
+ * linking to the stored HTML report when one exists. A logged-in operator also
+ * gets a **rerun** button on every failed run, which posts back to
+ * `/runs/<id>/rerun` to queue the same commit again.
  */
-export function renderDashboard(runs: RunRecord[]): string {
-  const rows = runs.map(renderRunRow).join("\n");
+export function renderDashboard(
+  runs: RunRecord[],
+  options: DashboardOptions = {},
+): string {
+  // The rerun column exists only for a logged-in viewer; everyone else sees
+  // exactly the read-only dashboard as before.
+  const canRerun = options.user !== undefined;
+  const rows = runs.map((run) => renderRunRow(run, canRerun)).join("\n");
   const body = runs.length === 0
     ? `<p class="empty">No runs recorded yet.</p>`
     : `<table>
-  <thead><tr><th>Status</th><th>Branch</th><th>Date</th><th>Duration</th><th>Report</th></tr></thead>
+  <thead><tr><th>Status</th><th>Branch</th><th>Date</th><th>Duration</th><th>Report</th>${
+      canRerun ? "<th>Rerun</th>" : ""
+    }</tr></thead>
   <tbody>
 ${rows}
   </tbody>
@@ -138,6 +163,7 @@ ${rows}
 <body>
 <header class="ok">
   <h1>whale-ci — recent runs</h1>
+  <p class="meta">${renderSession(options)}</p>
 </header>
 <main>
 ${body}
@@ -147,7 +173,17 @@ ${body}
 `;
 }
 
-function renderRunRow(run: RunRecord): string {
+/** The header's one-line account status: who is logged in, or how to log in. */
+function renderSession(options: DashboardOptions): string {
+  if (options.user !== undefined) {
+    return `Signed in as ${escapeHtml(options.user)}`;
+  }
+  return options.loginEnabled === true
+    ? `<a href="/login">Log in</a> to rerun failed runs`
+    : `Read-only: no ADMIN_PASSWORD is configured`;
+}
+
+function renderRunRow(run: RunRecord, canRerun: boolean): string {
   const branch = run.branch !== undefined
     ? escapeHtml(run.branch)
     : `<span class="muted">—</span>`;
@@ -160,6 +196,12 @@ function renderRunRow(run: RunRecord): string {
   const report = run.hasReport
     ? `<a href="/runs/${run.id}">report</a>`
     : `<span class="muted">—</span>`;
+  // A plain form post, so the button works without any JavaScript; the session
+  // cookie it carries is SameSite=Strict, which is what keeps another site from
+  // posting it on the operator's behalf.
+  const rerun = !canRerun ? "" : isRerunnable(run)
+    ? `\n      <td><form method="post" action="/runs/${run.id}/rerun"><button type="submit">rerun</button></form></td>`
+    : `\n      <td><span class="muted">—</span></td>`;
   return `    <tr>
       <td><span class="badge ${RUN_STATUS_CLASS[run.status]}">${
     RUN_STATUS_LABEL[run.status]
@@ -167,7 +209,7 @@ function renderRunRow(run: RunRecord): string {
       <td>${branch}${commit}</td>
       <td>${escapeHtml(formatDate(run.startedAt))}</td>
       <td>${duration}</td>
-      <td>${report}</td>
+      <td>${report}</td>${rerun}
     </tr>`;
 }
 
@@ -306,4 +348,17 @@ a { color: #58a6ff; }
 .muted { color: var(--muted); }
 .empty { color: var(--muted); }
 .badge.running { background: #1f6feb; }
+form { margin: 0; }
+button {
+  font: inherit;
+  font-size: .8rem;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: .2rem .7rem;
+  cursor: pointer;
+}
+button:hover { border-color: #58a6ff; color: #58a6ff; }
+header .meta a { color: #58a6ff; }
 `;
