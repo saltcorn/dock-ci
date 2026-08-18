@@ -1,6 +1,6 @@
 {
   "name": "whale-ci",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "Continuous integration with linked docker containers",
   "type": "module",
   "engines": {
